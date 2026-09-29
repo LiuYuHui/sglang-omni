@@ -6,8 +6,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache
 from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import Qwen3TTSSpeechTokenizer
+from mlx_lm.models.cache import KVCache
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang_omni.models.qwen3_tts.mlx.model import (
@@ -37,9 +37,7 @@ def sample_codec_token(
         row = mx.concatenate(
             [
                 row[:-CODEC_CONTROL_TOKEN_COUNT],
-                mx.full(
-                    (CODEC_CONTROL_TOKEN_COUNT,), -float("inf"), dtype=row.dtype
-                ),
+                mx.full((CODEC_CONTROL_TOKEN_COUNT,), -float("inf"), dtype=row.dtype),
             ]
         )
         row = mx.put_along_axis(

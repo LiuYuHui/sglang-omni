@@ -10,9 +10,9 @@ from typing import Literal
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
+from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import Qwen3TTSSpeechTokenizer
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.qwen3 import ModelArgs, Qwen3Model
-from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import Qwen3TTSSpeechTokenizer
 from pydantic import BaseModel, ConfigDict
 from transformers import PreTrainedTokenizerBase
 
@@ -261,7 +261,9 @@ def load_qwen3_tts_mlx_talker(
         elif name == "talker.model.codec_embedding.weight":
             talker_weights["model.embed_tokens.weight"] = weight
         elif name.startswith("talker.model.text_embedding."):
-            talker_weights[name.replace("talker.model.text_embedding.", "text_embedding.")] = weight
+            talker_weights[
+                name.replace("talker.model.text_embedding.", "text_embedding.")
+            ] = weight
         elif name.startswith("talker.text_projection.") or name.startswith(
             "talker.codec_head."
         ):
@@ -284,9 +286,9 @@ def load_qwen3_tts_mlx_talker(
             pass
 
     talker_expected = {name for name, _ in tree_flatten(talker.parameters())}
-    predictor_expected = {
-        name for name, _ in tree_flatten(predictor.parameters())
-    } - {"model.embed_tokens.weight"}
+    predictor_expected = {name for name, _ in tree_flatten(predictor.parameters())} - {
+        "model.embed_tokens.weight"
+    }
     if talker_weights.keys() != talker_expected:
         raise ValueError(
             "Qwen3-TTS MLX talker weight mismatch: "
@@ -316,6 +318,7 @@ def load_qwen3_tts_mlx_decoder(model_dir: Path) -> Qwen3TTSSpeechTokenizer:
         Qwen3TTSTokenizerDecoderConfig,
         filter_dict_for_dataclass,
     )
+
     tokenizer_dir = model_dir / "speech_tokenizer"
     config = json.loads((tokenizer_dir / "config.json").read_text(encoding="utf-8"))
     decoder_config = Qwen3TTSTokenizerDecoderConfig(
@@ -339,7 +342,11 @@ def load_qwen3_tts_mlx_decoder(model_dir: Path) -> Qwen3TTSSpeechTokenizer:
         mx.load(str(tokenizer_dir / "model.safetensors"))
     )
     decoder.load_weights(
-        [(name, weight) for name, weight in weights.items() if name.startswith("decoder.")],
+        [
+            (name, weight)
+            for name, weight in weights.items()
+            if name.startswith("decoder.")
+        ],
         strict=True,
     )
     mx.eval(decoder.parameters())

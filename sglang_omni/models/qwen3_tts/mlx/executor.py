@@ -56,7 +56,9 @@ def create_mlx_tts_executor(
     checkpoint_config = load_qwen3_tts_checkpoint_config(model_path)
     model_type = normalize_qwen3_tts_model_type(checkpoint_config.get("tts_model_type"))
     if model_type != "custom_voice":
-        raise ValueError("Qwen3-TTS MLX currently supports CustomVoice checkpoints only")
+        raise ValueError(
+            "Qwen3-TTS MLX currently supports CustomVoice checkpoints only"
+        )
     else:
         pass
 
@@ -69,8 +71,7 @@ def create_mlx_tts_executor(
         pass
     generator = Qwen3TTSMlxGenerator(converted_dir)
     speakers = {
-        name.casefold(): name
-        for name in generator.talker.artifact.talker_config.spk_id
+        name.casefold(): name for name in generator.talker.artifact.talker_config.spk_id
     }
 
     def generate(payload: StagePayload) -> StagePayload:
