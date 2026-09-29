@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Autoregressive MLX speech generation for Qwen3-TTS CustomVoice."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import mlx.core as mx
+from mlx_lm.models.cache import KVCache
+from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import Qwen3TTSSpeechTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
+from sglang_omni.models.qwen3_tts.mlx.model import (
+    Qwen3TTSMlxCodePredictor,
+    Qwen3TTSMlxTalker,
+    load_qwen3_tts_mlx_decoder,
+    load_qwen3_tts_mlx_talker,
+)
+
+CODEC_CONTROL_TOKEN_COUNT = 1024
+
+
+def sample_codec_token(
+    logits: mx.array,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float = 1.0,
+    seen_tokens: list[int] | None = None,
+    eos_token_id: int | None = None,
+) -> mx.array:
+    """Sample one token from the final-position logits."""
+    row = logits[0, -1, :].astype(mx.float32)
+    if eos_token_id is not None:
+        eos_logit = row[eos_token_id : eos_token_id + 1]
+        row = mx.concatenate(
+            [
+                row[:-CODEC_CONTROL_TOKEN_COUNT],
+                mx.full(
+                    (CODEC_CONTROL_TOKEN_COUNT,), -float("inf"), dtype=row.dtype
+                ),
+            ]
+        )
+        row = mx.put_along_axis(
+            row, mx.array([eos_token_id], dtype=mx.int32), eos_logit, axis=0
+        )
+    else:
+        pass
+    if seen_tokens and repetition_penalty != 1.0:
+        indices = mx.array(sorted(set(seen_tokens)), dtype=mx.int32)
+        selected = mx.take(row, indices)
+        adjusted = mx.where(
+            selected < 0,
+            selected * repetition_penalty,
+            selected / repetition_penalty,
+        )
+        row = mx.put_along_axis(row, indices, adjusted, axis=0)
+    else:
+        pass
+    if temperature <= 0:
+        return mx.argmax(row).reshape(1, 1).astype(mx.int32)
+    else:
+        pass
+    row = row / temperature
+    if top_k > 0 and top_k < row.shape[0]:
+        cutoff = mx.sort(row)[-top_k]
+        row = mx.where(row >= cutoff, row, -float("inf"))
+    else:
+        pass
+    if eos_token_id is not None:
+        row = mx.put_along_axis(
+            row,
+            mx.array([eos_token_id], dtype=mx.int32),
+            eos_logit / temperature,
+            axis=0,
+        )
+    else:
+        pass
+    if top_p < 1.0:
+        order = mx.argsort(-row)
+        sorted_logits = mx.take(row, order)
+        probabilities = mx.softmax(sorted_logits)
+        cumulative = mx.cumsum(probabilities)
+        sorted_logits = mx.where(
+            cumulative - probabilities < top_p,
+            sorted_logits,
+            -float("inf"),
+        )
+        if eos_token_id is not None:
+            eos_rank = mx.argmax(order == eos_token_id)
+            sorted_logits = mx.put_along_axis(
+                sorted_logits,
+                eos_rank.reshape(1),
+                row[eos_token_id : eos_token_id + 1],
+                axis=0,
+            )
+        else:
+            pass
+        rank = mx.random.categorical(sorted_logits[None, :])[0]
+        token = order[rank]
+    else:
+        token = mx.random.categorical(row[None, :])[0]
+    return token.reshape(1, 1).astype(mx.int32)
+
+
+class Qwen3TTSMlxGenerator:
+    """Run the local talker, code predictor, and speech decoder."""
+
+    def __init__(self, model_dir: Path) -> None:
+        self.talker: Qwen3TTSMlxTalker
+        self.predictor: Qwen3TTSMlxCodePredictor
+        self.talker, self.predictor = load_qwen3_tts_mlx_talker(model_dir)
+        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+            str(model_dir)
+        )
+        self.decoder: Qwen3TTSSpeechTokenizer = load_qwen3_tts_mlx_decoder(model_dir)
+
+    def generate(
+        self,
+        *,
+        text: str,
+        voice: str,
+        language: str,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+    ) -> tuple[mx.array, int]:
+        """Return a mono waveform and its semantic-token count."""
+        prompt, trailing_text, pad_embedding = self.talker.build_prompt_embeddings(
+            self.tokenizer, text=text, voice=voice, language=language
+        )
+        cache = [KVCache() for _ in self.talker.model.layers]
+        frames: list[mx.array] = []
+        seen_tokens: list[int] = []
+        eos_token_id = self.talker.artifact.talker_config.codec_eos_token_id
+        for step in range(max_new_tokens):
+            logits, hidden = self.talker.forward_embeddings(prompt, cache)
+            first_token = sample_codec_token(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                seen_tokens=seen_tokens,
+                eos_token_id=eos_token_id,
+            )
+            mx.eval(first_token)
+            token_id = int(first_token.item())
+            if token_id == eos_token_id:
+                break
+            else:
+                pass
+            seen_tokens.append(token_id)
+            code_tokens = [first_token]
+            code_cache = [KVCache() for _ in self.predictor.model.layers]
+            for code_group in range(
+                self.talker.artifact.talker_config.num_code_groups - 1
+            ):
+                if code_group == 0:
+                    code_input = mx.concatenate(
+                        [hidden, self.talker.model.embed_tokens(first_token)], axis=1
+                    )
+                else:
+                    code_input = self.predictor.codec_embedding[code_group - 1](
+                        code_tokens[-1]
+                    )
+                code_logits = self.predictor.forward_embeddings(
+                    code_input, cache=code_cache, code_group=code_group
+                )
+                code_tokens.append(
+                    sample_codec_token(
+                        code_logits,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+                )
+            frame = mx.concatenate(code_tokens, axis=1)
+            frames.append(frame)
+            codec_embedding = self.talker.model.embed_tokens(first_token)
+            for code_group, code_token in enumerate(code_tokens[1:]):
+                codec_embedding = codec_embedding + self.predictor.codec_embedding[
+                    code_group
+                ](code_token)
+            if step < trailing_text.shape[1]:
+                text_embedding = trailing_text[:, step : step + 1, :]
+            else:
+                text_embedding = pad_embedding
+            prompt = text_embedding + codec_embedding
+            mx.eval(prompt)
+        if not frames:
+            raise RuntimeError("Qwen3-TTS MLX generated no speech tokens")
+        else:
+            pass
+        codes = mx.stack(frames, axis=1)
+        waveform, lengths = self.decoder.decode(codes)
+        mx.eval(waveform, lengths)
+        return waveform[0, : int(lengths[0].item())], len(frames)

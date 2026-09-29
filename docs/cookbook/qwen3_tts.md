@@ -60,6 +60,46 @@ hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base
 
 ## Server Configuration
 
+### Apple Silicon MLX: 0.6B CustomVoice
+
+The MLX path serves one non-streaming request at a time with a predefined
+CustomVoice speaker. It runs the Qwen3-TTS talker and code predictor locally
+in MLX, with the `mlx-audio` speech decoder in one Omni stage. It does not use
+the SGLang autoregressive MLX engine or the CUDA three-stage pipeline. It uses
+the converted 0.6B checkpoint and does not require the `qwen-tts` Python package.
+Install the optional MLX dependency from this checkout on Apple Silicon:
+
+```bash
+SGLANG_OMNI_EXTRAS=qwen3-tts-mlx ./install.sh
+source .venv-apple/bin/activate
+```
+
+`mlx-audio` is pinned to 0.4.6 for compatibility with this repository's
+Transformers version. The official Qwen checkpoint supplies the model
+configuration and speaker list; the converted checkpoint supplies the MLX
+weights.
+
+```bash
+SGLANG_USE_MLX=1 sgl-omni serve \
+  --model-path Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --config examples/configs/qwen3_tts_0_6b_customvoice_mlx.yaml \
+  --port 8000
+```
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice","input":"Hello from MLX.","voice":"Ryan","language":"English","response_format":"wav","stream":false}' \
+  --output output.wav
+```
+
+This path supports CustomVoice speakers, language, seed, and the standard
+generation limit and sampling parameters. Streaming, voice cloning, style
+instructions, and speed changes are not yet supported. This implementation
+currently targets the 12Hz 0.6B CustomVoice checkpoint shown above.
+
+### CUDA
+
 The pipeline is `preprocessing → tts_engine → vocoder`. First startup can take several minutes
 while the `tts_engine` captures CUDA graphs.
 

@@ -25,7 +25,10 @@ from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
-from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
+from sglang_omni.models.qwen3_tts.config import (
+    Qwen3TTSMlxPipelineConfig,
+    Qwen3TTSPipelineConfig,
+)
 from sglang_omni.models.qwen3_tts.incremental_codec import (
     Qwen3TTSIncrementalCodecState,
     Qwen3TTSIncrementalCodecStateSpec,
@@ -33,6 +36,7 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
 from sglang_omni.models.qwen3_tts.incremental_codec_cuda_graph import (
     split_frames_by_width,
 )
+from sglang_omni.models.qwen3_tts.mlx import executor as qwen3_mlx
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.request_builders import (
     Qwen3TTSPreparedRequest,
@@ -297,6 +301,102 @@ def test_qwen3_tts_config_and_registry_contracts() -> None:
         PIPELINE_CONFIG_REGISTRY.get_config("Qwen3TTSForConditionalGeneration")
         is Qwen3TTSPipelineConfig
     )
+
+
+def test_qwen3_tts_mlx_config_selects_one_terminal_stage() -> None:
+    config_path = (
+        Path(__file__).parents[3]
+        / "examples/configs/qwen3_tts_0_6b_customvoice_mlx.yaml"
+    )
+    config = ConfigManager.from_file(str(config_path)).config
+
+    assert isinstance(config, Qwen3TTSMlxPipelineConfig)
+    assert config.terminal_stages == ["tts_engine"]
+    assert len(config.stages) == 1
+    assert config.stages[0].engine is None
+    assert (
+        config.stages[0].factory.mlx_model_path
+        == "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"
+    )
+
+
+def test_qwen3_tts_mlx_serves_custom_voice_waveform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class FakeGenerator:
+        talker = SimpleNamespace(
+            artifact=SimpleNamespace(
+                talker_config=SimpleNamespace(spk_id={"ryan": 2154})
+            )
+        )
+        decoder = SimpleNamespace(output_sample_rate=24000)
+
+        def __init__(self, model_dir: Path) -> None:
+            pass
+
+        def generate(
+            self,
+            *,
+            text: str,
+            voice: str,
+            language: str,
+            max_new_tokens: int,
+            temperature: float,
+            top_k: int,
+            top_p: float,
+            repetition_penalty: float,
+        ) -> tuple[np.ndarray, int]:
+            calls.append(voice)
+            return np.array([0.25, -0.25], dtype=np.float32), 7
+
+    monkeypatch.setitem(sys.modules, "mlx", types.ModuleType("mlx"))
+    mlx_core = types.ModuleType("mlx.core")
+    mlx_core.eval = lambda audio: None
+    mlx_core.random = SimpleNamespace(seed=lambda seed: None)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
+    runtime = types.ModuleType("sglang.srt.hardware_backend.mlx.runtime")
+    runtime.use_mlx = lambda: True
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    generator_module = types.ModuleType("sglang_omni.models.qwen3_tts.mlx.generate")
+    generator_module.Qwen3TTSMlxGenerator = FakeGenerator
+    monkeypatch.setitem(sys.modules, generator_module.__name__, generator_module)
+    monkeypatch.setattr(qwen3_mlx, "snapshot_download", lambda **kwargs: "/fake")
+    monkeypatch.setattr(
+        qwen3_mlx, "current_platform", SimpleNamespace(is_mps=lambda: True)
+    )
+    monkeypatch.setattr(
+        qwen3_mlx,
+        "load_qwen3_tts_checkpoint_config",
+        lambda model_path: {"tts_model_type": "custom_voice"},
+    )
+
+    scheduler = qwen3_mlx.create_mlx_tts_executor(
+        "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+        gpu_id=0,
+        mlx_model_path="mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
+    )
+    payload = make_payload(inputs="Hello", tts_params={"voice": "Ryan"})
+    result = scheduler.fn(payload)
+
+    assert np.frombuffer(result.data["audio_waveform"], dtype=np.float32).tolist() == [
+        0.25,
+        -0.25,
+    ]
+    assert result.data["sample_rate"] == 24000
+    assert result.data["modality"] == "audio"
+    assert result.data["usage"]["completion_tokens"] == 7
+    assert calls == ["ryan"]
+
+    with pytest.raises(ValueError, match="stream=false"):
+        scheduler.fn(make_payload(inputs="Hello", params={"stream": True}))
+    with pytest.raises(ValueError, match="speed=1.0"):
+        scheduler.fn(make_payload(inputs="Hello", tts_params={"speed": 1.2}))
+    with pytest.raises(ValueError, match="does not support instructions"):
+        scheduler.fn(
+            make_payload(inputs="Hello", tts_params={"instructions": "whisper"})
+        )
 
 
 def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(

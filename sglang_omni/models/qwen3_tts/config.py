@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import ClassVar, TypedDict
 
+from pydantic import Field
+
 from sglang_omni.config import (
     CustomVoiceConfig,
     EngineStageConfig,
@@ -220,3 +222,34 @@ def is_qwen3_tts_base_model(model_path: str) -> bool:
 
 
 EntryClass = Qwen3TTSPipelineConfig
+
+
+class Qwen3TTSMlxFactoryArgs(FactoryArgs):
+    """Converted checkpoint for the native MLX pipeline."""
+
+    mlx_model_path: str | None = None
+    mlx_model_revision: str | None = None
+
+
+class Qwen3TTSMlxStageConfig(StageConfig):
+    factory: Qwen3TTSMlxFactoryArgs = Field(default_factory=Qwen3TTSMlxFactoryArgs)
+
+
+class Qwen3TTSMlxPipelineConfig(Qwen3TTSPipelineConfig):
+    """Native CustomVoice inference on Apple Silicon."""
+
+    stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        "tts_engine": Qwen3TTSMlxStageConfig,
+    }
+    stages: list[StageConfig] = [
+        Qwen3TTSMlxStageConfig(
+            name="tts_engine",
+            process="pipeline",
+            factory_path=f"{_PKG}.mlx.executor.create_mlx_tts_executor",
+            gpu=0,
+            terminal=True,
+        ),
+    ]
+
+
+Variants = {"mlx": Qwen3TTSMlxPipelineConfig}
