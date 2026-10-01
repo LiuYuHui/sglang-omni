@@ -62,10 +62,12 @@ hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base
 
 ### Apple Silicon MLX: 0.6B CustomVoice
 
-The MLX path serves one request at a time with a predefined
-CustomVoice speaker. It runs the Qwen3-TTS talker and code predictor locally
-in MLX, with a local MLX speech decoder in one Omni stage. It does not use
-the SGLang autoregressive MLX engine or the CUDA three-stage pipeline. It uses
+The MLX path uses the same `preprocessing → tts_engine → vocoder` stages as
+CUDA, with predefined CustomVoice speakers. The talker, code predictor, and
+speech decoder run locally in MLX. One request is active by default. Concurrent
+requests share one set of model weights; codec chunks are generated round-robin, with independent
+request caches and sampling seeds. It does not use the SGLang autoregressive
+MLX engine. It uses
 the converted 0.6B checkpoint and does not require the `qwen-tts` or `mlx-audio`
 Python packages. Install from this checkout on Apple Silicon:
 
@@ -103,6 +105,13 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   -d '{"model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice","input":"Hello from MLX.","voice":"Ryan","language":"English","response_format":"pcm","stream":true}' \
   --output output.pcm
 ```
+
+Set `--tts-engine.factory.max_concurrency 2` to keep two requests active,
+or increase the limit further. Requests beyond the limit
+queue in arrival order. Concurrent requests share the Metal GPU, so increasing
+the limit does not guarantee higher throughput or real-time audio for every
+request. Buffered responses decode the complete codec sequence at the vocoder;
+streaming responses decode each chunk as it arrives.
 
 Voice cloning, style instructions, and speed changes are not yet supported. This implementation
 currently targets the 12Hz 0.6B CustomVoice checkpoint shown above.

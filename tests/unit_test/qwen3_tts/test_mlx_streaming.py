@@ -123,9 +123,10 @@ def test_decoder_streams_are_independent(
     )
 
 
-def test_generation_predictor_matches_fresh_cache_for_every_frame(
+@pytest.fixture
+def code_generator(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> Qwen3TTSMlxGenerator:
     mx.random.seed(31)
     predictor_config = Qwen3TTSMlxCodePredictorConfig(
         hidden_size=8,
@@ -180,6 +181,13 @@ def test_generation_predictor_matches_fresh_cache_for_every_frame(
     monkeypatch.setattr(
         generator.talker, "build_prompt_embeddings", build_prompt_embeddings
     )
+    return generator
+
+
+def test_generation_predictor_matches_fresh_cache_for_every_frame(
+    monkeypatch: pytest.MonkeyPatch, code_generator: Qwen3TTSMlxGenerator
+) -> None:
+    generator = code_generator
     forward_embeddings = generator.predictor.forward_embeddings
     reference_cache: list[ContiguousAttentionKVCache] = []
 

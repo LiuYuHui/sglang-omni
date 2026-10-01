@@ -10,7 +10,7 @@ import threading
 import time
 import types
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 from queue import Empty, Queue
 from types import SimpleNamespace
@@ -61,7 +61,7 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.sampling import seed as sampling_seed
-from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.scheduling.speaker_cache import (
@@ -304,32 +304,41 @@ def test_qwen3_tts_config_and_registry_contracts() -> None:
     )
 
 
-def test_qwen3_tts_mlx_config_selects_one_terminal_stage() -> None:
+def test_qwen3_tts_mlx_config_uses_three_stages_and_shared_checkpoint() -> None:
     config_path = (
         Path(__file__).parents[3]
         / "examples/configs/qwen3_tts_0_6b_customvoice_mlx.yaml"
     )
     config = ConfigManager.from_file(str(config_path)).config
+    stages = {stage.name: stage for stage in config.stages}
 
     assert isinstance(config, Qwen3TTSMlxPipelineConfig)
-    assert config.terminal_stages == ["tts_engine"]
-    assert len(config.stages) == 1
-    assert config.stages[0].engine is None
-    assert (
-        config.stages[0].factory.mlx_model_path
-        == "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"
-    )
+    assert config.resolved_entry_stage == "preprocessing"
+    assert config.terminal_stages == ["vocoder"]
+    assert stages["preprocessing"].next == "tts_engine"
+    assert stages["tts_engine"].next == "vocoder"
+    assert stages["tts_engine"].stream_to == ["vocoder"]
+    assert stages["vocoder"].can_accept_stream_before_payload
+    assert {stage.process for stage in config.stages} == {"pipeline"}
+    assert stages["tts_engine"].engine is None
+    assert stages["tts_engine"].factory.max_concurrency == 1
+    assert resolve_stage_factory_kwargs(stages["vocoder"], config) == {
+        "mlx_model_path": stages["tts_engine"].factory.mlx_model_path,
+        "mlx_model_revision": stages["tts_engine"].factory.mlx_model_revision,
+    }
+    assert config.generation_admission_defaults() == {}
 
 
 @pytest.mark.parametrize(
     ("is_streaming", "abort_after_first"), [(False, False), (True, False), (True, True)]
 )
-def test_qwen3_tts_mlx_serves_custom_voice_waveform(
+def test_qwen3_tts_mlx_engine_streams_codes_and_releases_aborted_requests(
     monkeypatch: pytest.MonkeyPatch,
     is_streaming: bool,
     abort_after_first: bool,
 ) -> None:
-    calls: list[str] = []
+    calls: list[tuple[str, int]] = []
+    closed = threading.Event()
 
     class FakeGenerator:
         talker = SimpleNamespace(
@@ -337,12 +346,11 @@ def test_qwen3_tts_mlx_serves_custom_voice_waveform(
                 talker_config=SimpleNamespace(spk_id={"ryan": 2154})
             )
         )
-        decoder = SimpleNamespace(output_sample_rate=24000)
 
         def __init__(self, model_dir: Path) -> None:
             pass
 
-        def generate_stream(
+        def generate_codes(
             self,
             *,
             text: str,
@@ -353,27 +361,28 @@ def test_qwen3_tts_mlx_serves_custom_voice_waveform(
             top_k: int,
             top_p: float,
             repetition_penalty: float,
-            chunk_frames: int,
-        ) -> Iterator[tuple[np.ndarray, int]]:
-            calls.append(voice)
-            yield np.array([0.25], dtype=np.float32), 3
-            assert scheduler.outbox.qsize() == int(is_streaming)
-            if abort_after_first:
-                scheduler.abort(payload.request_id)
-            else:
-                pass
-            yield np.array([-0.25], dtype=np.float32), 7
+            seed: int,
+        ) -> Generator[np.ndarray, None, None]:
+            calls.append((voice, seed))
+            try:
+                for frame_index in range(7):
+                    if frame_index == 4 and abort_after_first:
+                        scheduler.abort(payload.request_id)
+                    else:
+                        pass
+                    yield np.full((1, 16), frame_index, dtype=np.int32)
+            finally:
+                closed.set()
 
     monkeypatch.setitem(sys.modules, "mlx", types.ModuleType("mlx"))
     mlx_core = types.ModuleType("mlx.core")
-    mlx_core.eval = lambda audio: None
-    mlx_core.random = SimpleNamespace(seed=lambda seed: None)
+    mlx_core.stack = np.stack
     monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
     runtime = types.ModuleType("sglang.srt.hardware_backend.mlx.runtime")
     runtime.use_mlx = lambda: True
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
     generator_module = types.ModuleType("sglang_omni.models.qwen3_tts.mlx.generate")
-    generator_module.Qwen3TTSMlxGenerator = FakeGenerator
+    generator_module.Qwen3TTSMlxCodeGenerator = FakeGenerator
     monkeypatch.setitem(sys.modules, generator_module.__name__, generator_module)
     monkeypatch.setattr(qwen3_mlx, "snapshot_download", lambda **kwargs: "/fake")
     monkeypatch.setattr(
@@ -385,53 +394,114 @@ def test_qwen3_tts_mlx_serves_custom_voice_waveform(
         lambda model_path: {"tts_model_type": "custom_voice"},
     )
 
+    preprocessing = qwen3_mlx.create_mlx_preprocessing_executor()
     scheduler = qwen3_mlx.create_mlx_tts_executor(
         "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         gpu_id=0,
         stream_chunk_frames=4,
+        max_concurrency=2,
         mlx_model_path="mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
     )
-    payload = make_payload(
-        inputs="Hello", tts_params={"voice": "Ryan"}, params={"stream": is_streaming}
-    )
-    loop = asyncio.new_event_loop()
-    try:
-        scheduler.run_single(
-            IncomingMessage(
-                request_id=payload.request_id, type="new_request", data=payload
-            ),
-            loop,
+    payload = preprocessing.fn(
+        make_payload(
+            inputs="Hello",
+            tts_params={"voice": "Ryan", "seed": 42},
+            params={"stream": is_streaming},
         )
+    )
+    scheduler.inbox.put(
+        IncomingMessage(request_id=payload.request_id, type="new_request", data=payload)
+    )
+    worker = threading.Thread(target=scheduler.start)
+    worker.start()
+    try:
+        messages = [scheduler.outbox.get(timeout=2)]
+        if not abort_after_first:
+            messages.extend(scheduler.outbox.get(timeout=2) for _ in range(2))
+        else:
+            pass
+        assert closed.wait(timeout=2)
     finally:
-        loop.close()
-    messages = [scheduler.outbox.get_nowait() for _ in range(scheduler.outbox.qsize())]
+        scheduler.stop()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert calls == [("ryan", 42)]
     if abort_after_first:
         assert [message.type for message in messages] == ["stream"]
-    elif is_streaming:
-        assert [message.type for message in messages] == ["stream", "stream", "result"]
-        audio = b"".join(message.data["audio_waveform"] for message in messages[:-1])
-        assert np.frombuffer(audio, dtype=np.float32).tolist() == [0.25, -0.25]
-        assert "audio_waveform" not in messages[-1].data.data
-        assert messages[-1].data.data["usage"]["completion_tokens"] == 7
+        assert scheduler.outbox.empty()
     else:
-        assert [message.type for message in messages] == ["result"]
-        result = messages[0].data
-        assert np.frombuffer(
-            result.data["audio_waveform"], dtype=np.float32
-        ).tolist() == [0.25, -0.25]
-        assert result.data["sample_rate"] == 24000
-        assert result.data["modality"] == "audio"
-        assert result.data["usage"]["completion_tokens"] == 7
-    assert calls == ["ryan"]
+        assert [message.type for message in messages] == ["stream", "stream", "result"]
+        codes = np.concatenate([message.data for message in messages[:-1]], axis=1)
+        np.testing.assert_array_equal(codes[0, :, 0], np.arange(7))
+        assert messages[0].metadata == {
+            "modality": "audio_codes",
+            "is_streaming": is_streaming,
+        }
+        assert messages[-1].data.data["completion_tokens"] == 7
 
     with pytest.raises(ValueError, match="speed=1.0"):
-        list(scheduler.fn(make_payload(inputs="Hello", tts_params={"speed": 1.2})))
+        preprocessing.fn(make_payload(inputs="Hello", tts_params={"speed": 1.2}))
     with pytest.raises(ValueError, match="does not support instructions"):
-        list(
-            scheduler.fn(
-                make_payload(inputs="Hello", tts_params={"instructions": "whisper"})
-            )
+        preprocessing.fn(
+            make_payload(inputs="Hello", tts_params={"instructions": "whisper"})
         )
+
+
+@pytest.mark.parametrize("abort_first", [False, True])
+def test_qwen3_tts_mlx_scheduler_interleaves_requests_and_isolates_failures(
+    abort_first: bool,
+) -> None:
+    closed: list[str] = []
+
+    def generate(payload: StagePayload) -> Generator[OutgoingMessage, None, None]:
+        try:
+            yield OutgoingMessage(request_id=payload.request_id, type="stream", data=0)
+            if payload.request_id == "first":
+                if abort_first:
+                    scheduler.abort(payload.request_id)
+                else:
+                    raise ValueError("invalid request")
+            else:
+                pass
+            yield OutgoingMessage(request_id=payload.request_id, type="stream", data=1)
+            yield OutgoingMessage(
+                request_id=payload.request_id, type="result", data=payload
+            )
+        finally:
+            closed.append(payload.request_id)
+
+    scheduler = qwen3_mlx.Qwen3TTSMlxScheduler(generate, max_concurrency=2)
+    for request_id in ("first", "second", "third"):
+        payload = make_payload(inputs="Hello")
+        payload.request_id = request_id
+        scheduler.inbox.put(
+            IncomingMessage(request_id=request_id, type="new_request", data=payload)
+        )
+    worker = threading.Thread(target=scheduler.start)
+    worker.start()
+    try:
+        messages = [
+            scheduler.outbox.get(timeout=2) for _ in range(7 if abort_first else 8)
+        ]
+    finally:
+        scheduler.stop()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert [(message.request_id, message.type) for message in messages[:2]] == [
+        ("first", "stream"),
+        ("second", "stream"),
+    ]
+    if abort_first:
+        assert [
+            message.type for message in messages if message.request_id == "first"
+        ] == ["stream"]
+    else:
+        assert (messages[2].request_id, messages[2].type) == ("first", "error")
+    assert {message.request_id for message in messages if message.type == "result"} == {
+        "second",
+        "third",
+    }
+    assert set(closed) == {"first", "second", "third"}
 
 
 def test_qwen3_tts_speech_tokenizer_is_loaded_once_per_process_key(

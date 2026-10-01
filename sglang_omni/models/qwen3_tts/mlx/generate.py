@@ -34,6 +34,7 @@ def sample_codec_token(
     repetition_penalty: float = 1.0,
     seen_tokens: list[int] | None = None,
     eos_token_id: int | None = None,
+    key: mx.array | None = None,
 ) -> mx.array:
     """Sample one token from the final-position logits."""
     row = logits[0, -1, :].astype(mx.float32)
@@ -100,15 +101,15 @@ def sample_codec_token(
             )
         else:
             pass
-        rank = mx.random.categorical(sorted_logits[None, :])[0]
+        rank = mx.random.categorical(sorted_logits[None, :], key=key)[0]
         token = order[rank]
     else:
-        token = mx.random.categorical(row[None, :])[0]
+        token = mx.random.categorical(row[None, :], key=key)[0]
     return token.reshape(1, 1).astype(mx.int32)
 
 
-class Qwen3TTSMlxGenerator:
-    """Run the local talker, code predictor, and speech decoder."""
+class Qwen3TTSMlxCodeGenerator:
+    """Share talker weights while keeping generation state per request."""
 
     def __init__(self, model_dir: Path) -> None:
         self.talker: Qwen3TTSMlxTalker
@@ -117,7 +118,6 @@ class Qwen3TTSMlxGenerator:
         self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
             str(model_dir)
         )
-        self.decoder: Qwen3TTSMlxSpeechDecoder = load_qwen3_tts_mlx_decoder(model_dir)
 
     def generate_codes(
         self,
@@ -130,6 +130,7 @@ class Qwen3TTSMlxGenerator:
         top_k: int,
         top_p: float,
         repetition_penalty: float,
+        seed: int | None = None,
     ) -> Generator[mx.array, None, None]:
         """Yield one complete codec frame at a time."""
         prompt, trailing_text, pad_embedding = self.talker.build_prompt_embeddings(
@@ -146,8 +147,17 @@ class Qwen3TTSMlxGenerator:
             for _ in self.predictor.model.layers
         ]
         seen_tokens: list[int] = []
+        random_key = (
+            mx.random.key(seed) if seed is not None and temperature > 0 else None
+        )
+        code_group_count = self.talker.artifact.talker_config.num_code_groups
         eos_token_id = self.talker.artifact.talker_config.codec_eos_token_id
         for step in range(max_new_tokens):
+            if random_key is not None:
+                sample_keys = mx.random.split(random_key, num=code_group_count + 1)
+                random_key = sample_keys[0]
+            else:
+                sample_keys = None
             logits, hidden = self.talker.forward_embeddings(prompt, cache)
             first_token = sample_codec_token(
                 logits,
@@ -157,6 +167,7 @@ class Qwen3TTSMlxGenerator:
                 repetition_penalty=repetition_penalty,
                 seen_tokens=seen_tokens,
                 eos_token_id=eos_token_id,
+                key=sample_keys[1] if sample_keys is not None else None,
             )
             mx.eval(first_token)
             token_id = int(first_token.item())
@@ -188,6 +199,11 @@ class Qwen3TTSMlxGenerator:
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
+                        key=(
+                            sample_keys[code_group + 2]
+                            if sample_keys is not None
+                            else None
+                        ),
                     )
                 )
             frame = mx.concatenate(code_tokens, axis=1)
@@ -207,6 +223,14 @@ class Qwen3TTSMlxGenerator:
             raise RuntimeError("Qwen3-TTS MLX generated no speech tokens")
         else:
             pass
+
+
+class Qwen3TTSMlxGenerator(Qwen3TTSMlxCodeGenerator):
+    """Run codec generation and speech decoding for local callers."""
+
+    def __init__(self, model_dir: Path) -> None:
+        super().__init__(model_dir)
+        self.decoder: Qwen3TTSMlxSpeechDecoder = load_qwen3_tts_mlx_decoder(model_dir)
 
     def generate(
         self,
