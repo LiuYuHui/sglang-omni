@@ -28,6 +28,7 @@
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.qwen3 import MLP
 from pydantic import BaseModel, ConfigDict
 
 
@@ -148,28 +149,11 @@ class DecoderAttention(nn.Module):
         return self.o_proj(attended)
 
 
-class DecoderMLP(nn.Module):
-    def __init__(self, config: Qwen3TTSMlxDecoderConfig) -> None:
-        super().__init__()
-        self.gate_proj: nn.Linear = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.up_proj: nn.Linear = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.down_proj: nn.Linear = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
-
-    def __call__(self, hidden: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
-
-
 class DecoderTransformerLayer(nn.Module):
     def __init__(self, config: Qwen3TTSMlxDecoderConfig) -> None:
         super().__init__()
         self.self_attn: DecoderAttention = DecoderAttention(config)
-        self.mlp: DecoderMLP = DecoderMLP(config)
+        self.mlp: MLP = MLP(config.hidden_size, config.intermediate_size)
         self.input_layernorm: DecoderRMSNorm = DecoderRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )

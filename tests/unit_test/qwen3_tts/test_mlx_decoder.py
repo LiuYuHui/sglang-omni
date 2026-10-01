@@ -6,6 +6,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from importlib.metadata import version
+from math import prod
 from pathlib import Path
 from typing import Literal
 
@@ -164,8 +165,17 @@ def test_load_decoder_preserves_waveforms(
 
 
 @pytest.mark.parametrize(
-    ("batch_size", "frame_count"),
-    [(1, 1), (1, 7), (2, 7), (1, 300), (2, 301), (2, 601)],
+    ("batch_size", "frame_count", "upsample_rates", "upsampling_ratios"),
+    [
+        (1, 1, [2], [2]),
+        (1, 7, [2], [2]),
+        (2, 7, [2], [2]),
+        (1, 300, [2], [2]),
+        (2, 301, [2], [2]),
+        (2, 601, [2], [2]),
+        (1, 1, [8, 5, 4, 3], [3, 2]),
+        (2, 301, [8, 5, 4, 3], [3, 2]),
+    ],
 )
 @pytest.mark.parametrize(
     "dtype",
@@ -182,6 +192,8 @@ def test_loaded_decoder_matches_mlx_audio(
     decoder_config: Qwen3TTSMlxTokenizerConfig,
     batch_size: int,
     frame_count: int,
+    upsample_rates: list[int],
+    upsampling_ratios: list[int],
     dtype: mx.Dtype,
     num_key_value_heads: int,
     attention_bias: bool,
@@ -206,9 +218,16 @@ def test_loaded_decoder_matches_mlx_audio(
         update={
             "num_key_value_heads": num_key_value_heads,
             "attention_bias": attention_bias,
+            "upsample_rates": upsample_rates,
+            "upsampling_ratios": upsampling_ratios,
         }
     )
-    config = decoder_config.model_copy(update={"decoder_config": decoder_settings})
+    config = decoder_config.model_copy(
+        update={
+            "decoder_config": decoder_settings,
+            "decode_upsample_rate": prod(upsample_rates + upsampling_ratios),
+        }
+    )
     mx.random.seed(19)
     reference = Qwen3TTSSpeechTokenizer(
         Qwen3TTSTokenizerConfig(
@@ -254,9 +273,11 @@ def test_loaded_decoder_matches_mlx_audio(
 
     assert decoder.output_sample_rate == reference.output_sample_rate
     assert waveform.dtype == expected_waveform.dtype
-    np.testing.assert_array_equal(
+    np.testing.assert_allclose(
         np.asarray(waveform.astype(mx.float32)),
         np.asarray(expected_waveform.astype(mx.float32)),
+        rtol=1e-4,
+        atol=1e-6,
     )
     np.testing.assert_array_equal(np.asarray(lengths), np.asarray(expected_lengths))
     assert mx.max(mx.abs(expected_waveform)).item() > 0

@@ -47,6 +47,8 @@ CODEBOOK_EPSILON = 1e-5
 SNAKE_EPSILON = 1e-9
 RESIDUAL_KERNEL_SIZE = 7
 RESIDUAL_DILATIONS = (1, 3, 9)
+# note (Codex): Phase expansion wastes a 32-row GEMM tile for short inputs.
+TRANSPOSE_PHASE_MIN_ROWS = 32
 
 
 class Qwen3TTSMlxTokenizerConfig(BaseModel):
@@ -96,20 +98,41 @@ class CausalTransposeConv1d(nn.Module):
         self.conv: nn.ConvTranspose1d = nn.ConvTranspose1d(
             input_channels, output_channels, kernel_size, stride=stride
         )
-        self.trim_right: int = kernel_size - stride
 
     def __call__(self, hidden: mx.array) -> mx.array:
-        hidden = self.conv(hidden)
-        if self.trim_right > 0:
-            return hidden[:, : -self.trim_right, :]
+        output_channels, kernel_size, input_channels = self.conv.weight.shape
+        stride = self.conv.stride
+        if hidden.shape[0] * hidden.shape[1] < TRANSPOSE_PHASE_MIN_ROWS:
+            hidden = self.conv(hidden)
+            trim_right = kernel_size - stride
+            return hidden[:, :-trim_right, :] if trim_right > 0 else hidden
         else:
-            return hidden
+            phase_kernel_size = kernel_size // stride
+            # note (Codex): Each phase uses a short convolution without inserted zeros.
+            weight = (
+                self.conv.weight.reshape(
+                    output_channels, phase_kernel_size, stride, input_channels
+                )
+                .transpose(2, 0, 1, 3)[:, :, ::-1, :]
+                .reshape(stride * output_channels, phase_kernel_size, input_channels)
+            )
+            hidden = mx.conv_general(
+                hidden,
+                weight,
+                padding=((phase_kernel_size - 1,), (0,)),
+            )
+            hidden = hidden.reshape(
+                hidden.shape[0], hidden.shape[1] * stride, output_channels
+            )
+            return hidden + self.conv.bias
 
 
 @partial(mx.compile, shapeless=True)
-def scaled_sine(hidden: mx.array, alpha: mx.array) -> mx.array:
-    """Keep power and residual addition unfused to preserve float32 rounding."""
-    return mx.sin(hidden * alpha)
+def snake_beta_activation(
+    hidden: mx.array, alpha: mx.array, inverse_beta: mx.array
+) -> mx.array:
+    """Fuse waveform-sized operations to avoid intermediate allocations."""
+    return hidden + inverse_beta * mx.power(mx.sin(hidden * alpha), 2)
 
 
 class SnakeBeta(nn.Module):
@@ -120,10 +143,8 @@ class SnakeBeta(nn.Module):
 
     def __call__(self, hidden: mx.array) -> mx.array:
         alpha = mx.exp(self.alpha)
-        beta = mx.exp(self.beta)
-        return hidden + (1.0 / (beta + SNAKE_EPSILON)) * mx.power(
-            scaled_sine(hidden, alpha), 2
-        )
+        inverse_beta = 1.0 / (mx.exp(self.beta) + SNAKE_EPSILON)
+        return snake_beta_activation(hidden, alpha, inverse_beta)
 
 
 class ConvNeXtBlock(nn.Module):
