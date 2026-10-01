@@ -6,14 +6,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import mlx.core as mx
-from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import Qwen3TTSSpeechTokenizer
-from mlx_lm.models.cache import KVCache
+from sglang.srt.hardware_backend.mlx.kv_cache import ContiguousAttentionKVCache
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from sglang_omni.models.qwen3_tts.mlx.decoder import (
+    Qwen3TTSMlxSpeechDecoder,
+    load_qwen3_tts_mlx_decoder,
+)
 from sglang_omni.models.qwen3_tts.mlx.model import (
     Qwen3TTSMlxCodePredictor,
     Qwen3TTSMlxTalker,
-    load_qwen3_tts_mlx_decoder,
     load_qwen3_tts_mlx_talker,
 )
 
@@ -112,7 +114,7 @@ class Qwen3TTSMlxGenerator:
         self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
             str(model_dir)
         )
-        self.decoder: Qwen3TTSSpeechTokenizer = load_qwen3_tts_mlx_decoder(model_dir)
+        self.decoder: Qwen3TTSMlxSpeechDecoder = load_qwen3_tts_mlx_decoder(model_dir)
 
     def generate(
         self,
@@ -130,7 +132,10 @@ class Qwen3TTSMlxGenerator:
         prompt, trailing_text, pad_embedding = self.talker.build_prompt_embeddings(
             self.tokenizer, text=text, voice=voice, language=language
         )
-        cache = [KVCache() for _ in self.talker.model.layers]
+        cache = [
+            ContiguousAttentionKVCache(max_seq_len=prompt.shape[1] + max_new_tokens)
+            for _ in self.talker.model.layers
+        ]
         frames: list[mx.array] = []
         seen_tokens: list[int] = []
         eos_token_id = self.talker.artifact.talker_config.codec_eos_token_id
@@ -153,7 +158,12 @@ class Qwen3TTSMlxGenerator:
                 pass
             seen_tokens.append(token_id)
             code_tokens = [first_token]
-            code_cache = [KVCache() for _ in self.predictor.model.layers]
+            code_cache = [
+                ContiguousAttentionKVCache(
+                    max_seq_len=self.talker.artifact.talker_config.num_code_groups
+                )
+                for _ in self.predictor.model.layers
+            ]
             for code_group in range(
                 self.talker.artifact.talker_config.num_code_groups - 1
             ):

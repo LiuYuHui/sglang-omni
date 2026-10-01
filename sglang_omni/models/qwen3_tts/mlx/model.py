@@ -3,17 +3,15 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Literal
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
-from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import Qwen3TTSSpeechTokenizer
-from mlx_lm.models.cache import KVCache
 from mlx_lm.models.qwen3 import ModelArgs, Qwen3Model
 from pydantic import BaseModel, ConfigDict
+from sglang.srt.hardware_backend.mlx.kv_cache import ContiguousAttentionKVCache
 from transformers import PreTrainedTokenizerBase
 
 
@@ -116,14 +114,18 @@ class Qwen3TTSMlxTalker(nn.Module):
         return self.codec_head
 
     def forward_embeddings(
-        self, embeddings: mx.array, cache: list[KVCache] | None = None
+        self,
+        embeddings: mx.array,
+        cache: list[ContiguousAttentionKVCache] | None = None,
     ) -> tuple[mx.array, mx.array]:
         hidden = self.model(inputs=None, cache=cache, input_embeddings=embeddings)
         last_hidden = hidden[:, -1:, :]
         return self.codec_head(last_hidden), last_hidden
 
     def __call__(
-        self, input_ids: mx.array, cache: list[KVCache] | None = None
+        self,
+        input_ids: mx.array,
+        cache: list[ContiguousAttentionKVCache] | None = None,
     ) -> mx.array:
         embeddings = self.model.embed_tokens(input_ids)
         logits, _ = self.forward_embeddings(embeddings, cache)
@@ -229,7 +231,7 @@ class Qwen3TTSMlxCodePredictor(nn.Module):
         self,
         embeddings: mx.array,
         *,
-        cache: list[KVCache],
+        cache: list[ContiguousAttentionKVCache],
         code_group: int,
     ) -> mx.array:
         if self.small_to_mtp_projection is not None:
@@ -309,46 +311,3 @@ def load_qwen3_tts_mlx_talker(
     predictor.load_weights(list(predictor_weights.items()), strict=False)
     mx.eval(talker.parameters(), predictor.parameters())
     return talker, predictor
-
-
-def load_qwen3_tts_mlx_decoder(model_dir: Path) -> Qwen3TTSSpeechTokenizer:
-    """Load only the speech decoder, without the unused reference encoder."""
-    from mlx_audio.tts.models.qwen3_tts.config import (
-        Qwen3TTSTokenizerConfig,
-        Qwen3TTSTokenizerDecoderConfig,
-        filter_dict_for_dataclass,
-    )
-
-    tokenizer_dir = model_dir / "speech_tokenizer"
-    config = json.loads((tokenizer_dir / "config.json").read_text(encoding="utf-8"))
-    decoder_config = Qwen3TTSTokenizerDecoderConfig(
-        **filter_dict_for_dataclass(
-            Qwen3TTSTokenizerDecoderConfig, config["decoder_config"]
-        )
-    )
-    tokenizer_config = Qwen3TTSTokenizerConfig(
-        encoder_config=None, decoder_config=decoder_config
-    )
-    for name in (
-        "input_sample_rate",
-        "output_sample_rate",
-        "decode_upsample_rate",
-        "encode_downsample_rate",
-        "encoder_valid_num_quantizers",
-    ):
-        setattr(tokenizer_config, name, config[name])
-    decoder = Qwen3TTSSpeechTokenizer(tokenizer_config)
-    weights = Qwen3TTSSpeechTokenizer.sanitize(
-        mx.load(str(tokenizer_dir / "model.safetensors"))
-    )
-    decoder.load_weights(
-        [
-            (name, weight)
-            for name, weight in weights.items()
-            if name.startswith("decoder.")
-        ],
-        strict=True,
-    )
-    mx.eval(decoder.parameters())
-    decoder.eval()
-    return decoder

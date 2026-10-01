@@ -118,11 +118,6 @@ fun-cosyvoice3 = [
     "matplotlib",
 ]
 
-qwen3-tts-mlx = [
-    # Pin for compatibility with the repository's Transformers 5.12.1.
-    "mlx-audio[tts]==0.4.6; sys_platform == 'darwin' and platform_machine == 'arm64'",
-]
-
 minicpm-o = [
     "einops>=0.8.1",
     "onnx>=1.18.0",
