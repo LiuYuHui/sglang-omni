@@ -62,7 +62,7 @@ hf download Qwen/Qwen3-TTS-12Hz-1.7B-Base
 
 ### Apple Silicon MLX: 0.6B CustomVoice
 
-The MLX path serves one non-streaming request at a time with a predefined
+The MLX path serves one request at a time with a predefined
 CustomVoice speaker. It runs the Qwen3-TTS talker and code predictor locally
 in MLX, with a local MLX speech decoder in one Omni stage. It does not use
 the SGLang autoregressive MLX engine or the CUDA three-stage pipeline. It uses
@@ -92,8 +92,19 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 ```
 
 This path supports CustomVoice speakers, language, seed, and the standard
-generation limit and sampling parameters. Streaming, voice cloning, style
-instructions, and speed changes are not yet supported. This implementation
+generation limit and sampling parameters. Streaming returns PCM audio as codec
+frames are generated, with request-local attention and convolution caches.
+The default chunk contains four codec frames (320 ms of audio); configure it
+with `--tts-engine.factory.stream_chunk_frames`. For example:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice","input":"Hello from MLX.","voice":"Ryan","language":"English","response_format":"pcm","stream":true}' \
+  --output output.pcm
+```
+
+Voice cloning, style instructions, and speed changes are not yet supported. This implementation
 currently targets the 12Hz 0.6B CustomVoice checkpoint shown above.
 
 ### CUDA

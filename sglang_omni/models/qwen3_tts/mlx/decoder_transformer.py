@@ -30,6 +30,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.qwen3 import MLP
 from pydantic import BaseModel, ConfigDict
+from sglang.srt.hardware_backend.mlx.kv_cache import ContiguousAttentionKVCache
 
 
 class Qwen3TTSMlxDecoderConfig(BaseModel):
@@ -118,6 +119,7 @@ class DecoderAttention(nn.Module):
         hidden: mx.array,
         position_embeddings: tuple[mx.array, mx.array],
         mask: mx.array | None,
+        cache: ContiguousAttentionKVCache | None = None,
     ) -> mx.array:
         batch_size, frame_count, _ = hidden.shape
         queries = (
@@ -142,6 +144,10 @@ class DecoderAttention(nn.Module):
         cosine, sine = position_embeddings
         queries = apply_rotary_embedding(queries, cosine[:, None], sine[:, None])
         keys = apply_rotary_embedding(keys, cosine[:, None], sine[:, None])
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            pass
         attended = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
@@ -172,9 +178,10 @@ class DecoderTransformerLayer(nn.Module):
         hidden: mx.array,
         position_embeddings: tuple[mx.array, mx.array],
         mask: mx.array | None,
+        cache: ContiguousAttentionKVCache | None = None,
     ) -> mx.array:
         attended = self.self_attn(
-            self.input_layernorm(hidden), position_embeddings, mask
+            self.input_layernorm(hidden), position_embeddings, mask, cache
         )
         hidden = hidden + self.self_attn_layer_scale(attended)
         return hidden + self.mlp_layer_scale(
@@ -202,11 +209,16 @@ class DecoderTransformer(nn.Module):
         self.input_proj: nn.Linear = nn.Linear(config.latent_dim, config.hidden_size)
         self.output_proj: nn.Linear = nn.Linear(config.hidden_size, config.latent_dim)
 
-    def __call__(self, embeddings: mx.array) -> mx.array:
+    def __call__(
+        self,
+        embeddings: mx.array,
+        cache: list[ContiguousAttentionKVCache] | None = None,
+    ) -> mx.array:
         batch_size, frame_count, _ = embeddings.shape
         hidden = self.input_proj(embeddings)
+        offset = cache[0].offset if cache is not None else 0
         position_ids = mx.broadcast_to(
-            mx.arange(frame_count)[None, :], (batch_size, frame_count)
+            mx.arange(offset, offset + frame_count)[None, :], (batch_size, frame_count)
         )
         inverse_frequency = (
             self._inverse_frequency
@@ -223,8 +235,17 @@ class DecoderTransformer(nn.Module):
             mask = nn.MultiHeadAttention.create_additive_causal_mask(
                 frame_count
             ).astype(hidden.dtype)
+            if offset > 0:
+                mask = mx.pad(mask, [(0, 0), (offset, 0)])
+            else:
+                pass
         else:
             mask = None
-        for layer in self.layers:
-            hidden = layer(hidden, position_embeddings, mask)
+        for i, layer in enumerate(self.layers):
+            hidden = layer(
+                hidden,
+                position_embeddings,
+                mask,
+                cache[i] if cache is not None else None,
+            )
         return self.output_proj(self.norm(hidden))

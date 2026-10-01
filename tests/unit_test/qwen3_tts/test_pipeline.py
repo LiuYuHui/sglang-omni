@@ -10,6 +10,7 @@ import threading
 import time
 import types
 from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
 from queue import Empty, Queue
 from types import SimpleNamespace
@@ -320,8 +321,13 @@ def test_qwen3_tts_mlx_config_selects_one_terminal_stage() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("is_streaming", "abort_after_first"), [(False, False), (True, False), (True, True)]
+)
 def test_qwen3_tts_mlx_serves_custom_voice_waveform(
     monkeypatch: pytest.MonkeyPatch,
+    is_streaming: bool,
+    abort_after_first: bool,
 ) -> None:
     calls: list[str] = []
 
@@ -336,7 +342,7 @@ def test_qwen3_tts_mlx_serves_custom_voice_waveform(
         def __init__(self, model_dir: Path) -> None:
             pass
 
-        def generate(
+        def generate_stream(
             self,
             *,
             text: str,
@@ -347,9 +353,16 @@ def test_qwen3_tts_mlx_serves_custom_voice_waveform(
             top_k: int,
             top_p: float,
             repetition_penalty: float,
-        ) -> tuple[np.ndarray, int]:
+            chunk_frames: int,
+        ) -> Iterator[tuple[np.ndarray, int]]:
             calls.append(voice)
-            return np.array([0.25, -0.25], dtype=np.float32), 7
+            yield np.array([0.25], dtype=np.float32), 3
+            assert scheduler.outbox.qsize() == int(is_streaming)
+            if abort_after_first:
+                scheduler.abort(payload.request_id)
+            else:
+                pass
+            yield np.array([-0.25], dtype=np.float32), 7
 
     monkeypatch.setitem(sys.modules, "mlx", types.ModuleType("mlx"))
     mlx_core = types.ModuleType("mlx.core")
@@ -375,27 +388,49 @@ def test_qwen3_tts_mlx_serves_custom_voice_waveform(
     scheduler = qwen3_mlx.create_mlx_tts_executor(
         "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         gpu_id=0,
+        stream_chunk_frames=4,
         mlx_model_path="mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
     )
-    payload = make_payload(inputs="Hello", tts_params={"voice": "Ryan"})
-    result = scheduler.fn(payload)
-
-    assert np.frombuffer(result.data["audio_waveform"], dtype=np.float32).tolist() == [
-        0.25,
-        -0.25,
-    ]
-    assert result.data["sample_rate"] == 24000
-    assert result.data["modality"] == "audio"
-    assert result.data["usage"]["completion_tokens"] == 7
+    payload = make_payload(
+        inputs="Hello", tts_params={"voice": "Ryan"}, params={"stream": is_streaming}
+    )
+    loop = asyncio.new_event_loop()
+    try:
+        scheduler.run_single(
+            IncomingMessage(
+                request_id=payload.request_id, type="new_request", data=payload
+            ),
+            loop,
+        )
+    finally:
+        loop.close()
+    messages = [scheduler.outbox.get_nowait() for _ in range(scheduler.outbox.qsize())]
+    if abort_after_first:
+        assert [message.type for message in messages] == ["stream"]
+    elif is_streaming:
+        assert [message.type for message in messages] == ["stream", "stream", "result"]
+        audio = b"".join(message.data["audio_waveform"] for message in messages[:-1])
+        assert np.frombuffer(audio, dtype=np.float32).tolist() == [0.25, -0.25]
+        assert "audio_waveform" not in messages[-1].data.data
+        assert messages[-1].data.data["usage"]["completion_tokens"] == 7
+    else:
+        assert [message.type for message in messages] == ["result"]
+        result = messages[0].data
+        assert np.frombuffer(
+            result.data["audio_waveform"], dtype=np.float32
+        ).tolist() == [0.25, -0.25]
+        assert result.data["sample_rate"] == 24000
+        assert result.data["modality"] == "audio"
+        assert result.data["usage"]["completion_tokens"] == 7
     assert calls == ["ryan"]
 
-    with pytest.raises(ValueError, match="stream=false"):
-        scheduler.fn(make_payload(inputs="Hello", params={"stream": True}))
     with pytest.raises(ValueError, match="speed=1.0"):
-        scheduler.fn(make_payload(inputs="Hello", tts_params={"speed": 1.2}))
+        list(scheduler.fn(make_payload(inputs="Hello", tts_params={"speed": 1.2})))
     with pytest.raises(ValueError, match="does not support instructions"):
-        scheduler.fn(
-            make_payload(inputs="Hello", tts_params={"instructions": "whisper"})
+        list(
+            scheduler.fn(
+                make_payload(inputs="Hello", tts_params={"instructions": "whisper"})
+            )
         )
 
 

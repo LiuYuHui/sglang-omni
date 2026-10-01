@@ -23,6 +23,9 @@ from sglang_omni.models.qwen3_tts.mlx.decoder import (  # noqa: E402 - MLX is op
     Qwen3TTSMlxTokenizerConfig,
     load_qwen3_tts_mlx_decoder,
 )
+from sglang_omni.models.qwen3_tts.mlx.decoder_stream import (  # noqa: E402 - MLX is optional outside Apple Silicon.
+    Qwen3TTSMlxDecoderStream,
+)
 from sglang_omni.models.qwen3_tts.mlx.decoder_transformer import (  # noqa: E402 - MLX is optional outside Apple Silicon.
     Qwen3TTSMlxDecoderConfig,
 )
@@ -112,6 +115,29 @@ def test_decode_is_causal_and_independent_between_calls(
         prefix_waveform, full_waveform[:, :12], rtol=1e-5, atol=1e-5
     ).item()
     assert mx.array_equal(repeated_waveform, full_waveform).item()
+
+
+def test_decode_uses_reloaded_convolution_weights(
+    decoder_config: Qwen3TTSMlxTokenizerConfig,
+) -> None:
+    mx.random.seed(53)
+    decoder = Qwen3TTSMlxSpeechDecoder(decoder_config)
+    codes = mx.arange(96, dtype=mx.int32).reshape(1, 32, 3) % 15 + 1
+    original, _ = decoder.decode(codes)
+    mx.eval(original)
+    weights = [
+        (name, weight * 0.5 if "block.1.conv.weight" in name else weight)
+        for name, weight in tree_flatten(decoder.parameters())
+    ]
+    decoder.load_weights(weights)
+    reloaded, _ = decoder.decode(codes)
+    fresh_decoder = Qwen3TTSMlxSpeechDecoder(decoder_config)
+    fresh_decoder.load_weights(weights)
+    expected, _ = fresh_decoder.decode(codes)
+    mx.eval(reloaded, expected)
+
+    assert not mx.allclose(reloaded, original).item()
+    np.testing.assert_array_equal(np.asarray(reloaded), np.asarray(expected))
 
 
 @pytest.mark.parametrize(
@@ -284,13 +310,19 @@ def test_loaded_decoder_matches_mlx_audio(
 
 
 @pytest.mark.parametrize("shape", [(1, 0, 3), (1, 2, 2), (1, 2)])
+@pytest.mark.parametrize("is_streaming", [False, True])
 def test_decode_rejects_invalid_codec_frames(
-    decoder_config: Qwen3TTSMlxTokenizerConfig, shape: tuple[int, ...]
+    decoder_config: Qwen3TTSMlxTokenizerConfig,
+    shape: tuple[int, ...],
+    is_streaming: bool,
 ) -> None:
     decoder = Qwen3TTSMlxSpeechDecoder(decoder_config)
+    decode = (
+        Qwen3TTSMlxDecoderStream(decoder).decode if is_streaming else decoder.decode
+    )
 
     with pytest.raises(ValueError, match="codec frames|quantizers"):
-        decoder.decode(mx.ones(shape, dtype=mx.int32))
+        decode(mx.ones(shape, dtype=mx.int32))
 
 
 def test_load_decoder_rejects_missing_weights(

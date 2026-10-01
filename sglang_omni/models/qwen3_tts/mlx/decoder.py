@@ -79,11 +79,11 @@ class CausalConv1d(nn.Module):
             groups=groups,
         )
 
-    def __call__(self, hidden: mx.array) -> mx.array:
+    def __call__(self, hidden: mx.array, *, padding: int | None = None) -> mx.array:
         hidden = mx.conv_general(
             hidden,
             self.conv.weight,
-            padding=((self.padding,), (0,)),
+            padding=((self.padding if padding is None else padding,), (0,)),
             kernel_dilation=self.conv.dilation,
             groups=self.conv.groups,
         )
@@ -98,28 +98,52 @@ class CausalTransposeConv1d(nn.Module):
         self.conv: nn.ConvTranspose1d = nn.ConvTranspose1d(
             input_channels, output_channels, kernel_size, stride=stride
         )
+        self._phase_weight: (  # noqa: leading-underscore - Non-parameter cache.
+            tuple[mx.array, mx.array] | None
+        ) = None
+
+    def phase_weight(self, dtype: mx.Dtype) -> mx.array:
+        cached = self._phase_weight  # noqa: leading-underscore - Non-parameter cache.
+        if (
+            cached is not None
+            and cached[0] is self.conv.weight
+            and cached[1].dtype == dtype
+        ):
+            return cached[1]
+        else:
+            output_channels, kernel_size, input_channels = self.conv.weight.shape
+            phase_kernel_size = kernel_size // self.conv.stride
+            weight = (
+                self.conv.weight.reshape(
+                    output_channels, phase_kernel_size, self.conv.stride, input_channels
+                )
+                .transpose(2, 0, 1, 3)[:, :, ::-1, :]
+                .reshape(
+                    self.conv.stride * output_channels,
+                    phase_kernel_size,
+                    input_channels,
+                )
+                .astype(dtype)
+            )
+            self._phase_weight = (
+                self.conv.weight,
+                weight,
+            )  # noqa: leading-underscore - Non-parameter cache.
+            return weight
 
     def __call__(self, hidden: mx.array) -> mx.array:
-        output_channels, kernel_size, input_channels = self.conv.weight.shape
+        output_channels, kernel_size, _ = self.conv.weight.shape
         stride = self.conv.stride
         if hidden.shape[0] * hidden.shape[1] < TRANSPOSE_PHASE_MIN_ROWS:
             hidden = self.conv(hidden)
             trim_right = kernel_size - stride
             return hidden[:, :-trim_right, :] if trim_right > 0 else hidden
         else:
-            phase_kernel_size = kernel_size // stride
             # note (Codex): Each phase uses a short convolution without inserted zeros.
-            weight = (
-                self.conv.weight.reshape(
-                    output_channels, phase_kernel_size, stride, input_channels
-                )
-                .transpose(2, 0, 1, 3)[:, :, ::-1, :]
-                .reshape(stride * output_channels, phase_kernel_size, input_channels)
-            )
             hidden = mx.conv_general(
                 hidden,
-                weight,
-                padding=((phase_kernel_size - 1,), (0,)),
+                self.phase_weight(mx.result_type(hidden.dtype, self.conv.weight.dtype)),
+                padding=((kernel_size // stride - 1,), (0,)),
             )
             hidden = hidden.reshape(
                 hidden.shape[0], hidden.shape[1] * stride, output_channels
@@ -310,8 +334,8 @@ class Qwen3TTSMlxSpeechDecoder(nn.Module):
             hidden = decoder_layer(hidden)
         return mx.clip(hidden.transpose(0, 2, 1), -1.0, 1.0)
 
-    def decode(self, codes: mx.array) -> tuple[mx.array, mx.array]:
-        """Accept codes shaped as batch, frames, quantizers."""
+    def validate_codes(self, codes: mx.array) -> None:
+        """Require non-empty batch-major codec frames with all quantizers."""
         if codes.ndim != 3 or codes.shape[1] == 0:
             raise ValueError(
                 "Qwen3-TTS MLX decoder requires non-empty batch-major codec frames"
@@ -321,18 +345,21 @@ class Qwen3TTSMlxSpeechDecoder(nn.Module):
                 f"Expected {self.num_quantizers} quantizers, got {codes.shape[2]}"
             )
         else:
-            waveforms: list[mx.array] = []
-            for start_frame in range(0, codes.shape[1], DECODE_CHUNK_FRAMES):
-                end_frame = min(start_frame + DECODE_CHUNK_FRAMES, codes.shape[1])
-                context_frames = min(start_frame, DECODE_LEFT_CONTEXT_FRAMES)
-                chunk_codes = codes[:, start_frame - context_frames : end_frame]
-                chunk_waveform = self(chunk_codes.transpose(0, 2, 1)).squeeze(1)
-                waveforms.append(
-                    chunk_waveform[:, context_frames * self.total_upsample :]
-                )
-            waveform = mx.concatenate(waveforms, axis=-1)
-            lengths = (codes[..., 0] > 0).sum(axis=1) * self.decode_upsample_rate
-            return waveform, lengths
+            pass
+
+    def decode(self, codes: mx.array) -> tuple[mx.array, mx.array]:
+        """Accept codes shaped as batch, frames, quantizers."""
+        self.validate_codes(codes)
+        waveforms: list[mx.array] = []
+        for start_frame in range(0, codes.shape[1], DECODE_CHUNK_FRAMES):
+            end_frame = min(start_frame + DECODE_CHUNK_FRAMES, codes.shape[1])
+            context_frames = min(start_frame, DECODE_LEFT_CONTEXT_FRAMES)
+            chunk_codes = codes[:, start_frame - context_frames : end_frame]
+            chunk_waveform = self(chunk_codes.transpose(0, 2, 1)).squeeze(1)
+            waveforms.append(chunk_waveform[:, context_frames * self.total_upsample :])
+        waveform = mx.concatenate(waveforms, axis=-1)
+        lengths = (codes[..., 0] > 0).sum(axis=1) * self.decode_upsample_rate
+        return waveform, lengths
 
 
 def load_qwen3_tts_mlx_decoder(model_dir: Path) -> Qwen3TTSMlxSpeechDecoder:

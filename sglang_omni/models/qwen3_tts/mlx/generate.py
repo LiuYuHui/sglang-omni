@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from itertools import islice
 from pathlib import Path
 
 import mlx.core as mx
@@ -13,6 +15,7 @@ from sglang_omni.models.qwen3_tts.mlx.decoder import (
     Qwen3TTSMlxSpeechDecoder,
     load_qwen3_tts_mlx_decoder,
 )
+from sglang_omni.models.qwen3_tts.mlx.decoder_stream import Qwen3TTSMlxDecoderStream
 from sglang_omni.models.qwen3_tts.mlx.model import (
     Qwen3TTSMlxCodePredictor,
     Qwen3TTSMlxTalker,
@@ -116,7 +119,7 @@ class Qwen3TTSMlxGenerator:
         )
         self.decoder: Qwen3TTSMlxSpeechDecoder = load_qwen3_tts_mlx_decoder(model_dir)
 
-    def generate(
+    def generate_codes(
         self,
         *,
         text: str,
@@ -127,8 +130,8 @@ class Qwen3TTSMlxGenerator:
         top_k: int,
         top_p: float,
         repetition_penalty: float,
-    ) -> tuple[mx.array, int]:
-        """Return a mono waveform and its semantic-token count."""
+    ) -> Generator[mx.array, None, None]:
+        """Yield one complete codec frame at a time."""
         prompt, trailing_text, pad_embedding = self.talker.build_prompt_embeddings(
             self.tokenizer, text=text, voice=voice, language=language
         )
@@ -136,7 +139,12 @@ class Qwen3TTSMlxGenerator:
             ContiguousAttentionKVCache(max_seq_len=prompt.shape[1] + max_new_tokens)
             for _ in self.talker.model.layers
         ]
-        frames: list[mx.array] = []
+        code_cache = [
+            ContiguousAttentionKVCache(
+                max_seq_len=self.talker.artifact.talker_config.num_code_groups
+            )
+            for _ in self.predictor.model.layers
+        ]
         seen_tokens: list[int] = []
         eos_token_id = self.talker.artifact.talker_config.codec_eos_token_id
         for step in range(max_new_tokens):
@@ -158,12 +166,8 @@ class Qwen3TTSMlxGenerator:
                 pass
             seen_tokens.append(token_id)
             code_tokens = [first_token]
-            code_cache = [
-                ContiguousAttentionKVCache(
-                    max_seq_len=self.talker.artifact.talker_config.num_code_groups
-                )
-                for _ in self.predictor.model.layers
-            ]
+            for layer_cache in code_cache:
+                layer_cache.reset()
             for code_group in range(
                 self.talker.artifact.talker_config.num_code_groups - 1
             ):
@@ -187,7 +191,6 @@ class Qwen3TTSMlxGenerator:
                     )
                 )
             frame = mx.concatenate(code_tokens, axis=1)
-            frames.append(frame)
             codec_embedding = self.talker.model.embed_tokens(first_token)
             for code_group, code_token in enumerate(code_tokens[1:]):
                 codec_embedding = codec_embedding + self.predictor.codec_embedding[
@@ -198,12 +201,79 @@ class Qwen3TTSMlxGenerator:
             else:
                 text_embedding = pad_embedding
             prompt = text_embedding + codec_embedding
-            mx.eval(prompt)
-        if not frames:
+            mx.async_eval(prompt)
+            yield frame
+        if not seen_tokens:
             raise RuntimeError("Qwen3-TTS MLX generated no speech tokens")
         else:
             pass
+
+    def generate(
+        self,
+        *,
+        text: str,
+        voice: str,
+        language: str,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+    ) -> tuple[mx.array, int]:
+        """Return a mono waveform and its semantic-token count."""
+        frames = list(
+            self.generate_codes(
+                text=text,
+                voice=voice,
+                language=language,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+        )
         codes = mx.stack(frames, axis=1)
         waveform, lengths = self.decoder.decode(codes)
         mx.eval(waveform, lengths)
         return waveform[0, : int(lengths[0].item())], len(frames)
+
+    def generate_stream(
+        self,
+        *,
+        text: str,
+        voice: str,
+        language: str,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float,
+        chunk_frames: int,
+    ) -> Generator[tuple[mx.array, int], None, None]:
+        """Yield waveform chunks and the cumulative semantic-token count."""
+        if chunk_frames <= 0:
+            raise ValueError("Qwen3-TTS MLX chunk_frames must be positive")
+        else:
+            pass
+        frames = self.generate_codes(
+            text=text,
+            voice=voice,
+            language=language,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+        decoder_stream = Qwen3TTSMlxDecoderStream(self.decoder)
+        token_count = 0
+        # note (Codex): Match offline prefix trimming when zero semantic codes shorten audio.
+        pending_waveform: mx.array = mx.zeros((0,))
+        while chunk := list(islice(frames, chunk_frames)):
+            token_count += len(chunk)
+            waveform, lengths = decoder_stream.decode(mx.stack(chunk, axis=1))
+            pending_waveform = mx.concatenate([pending_waveform, waveform[0]])
+            valid_samples = int(lengths[0].item())
+            yield pending_waveform[:valid_samples], token_count
+            pending_waveform = pending_waveform[valid_samples:]

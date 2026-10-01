@@ -229,6 +229,7 @@ class Qwen3TTSMlxFactoryArgs(FactoryArgs):
 
     mlx_model_path: str | None = None
     mlx_model_revision: str | None = None
+    stream_chunk_frames: int = Field(default=4, gt=0)
 
 
 class Qwen3TTSMlxStageConfig(StageConfig):
