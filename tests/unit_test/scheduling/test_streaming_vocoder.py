@@ -267,7 +267,10 @@ def test_vocoder_decode_stream_priority_leaves_the_top_level_free(
     expected_priority: int,
 ) -> None:
     monkeypatch.setattr(
-        torch.cuda.Stream, "priority_range", staticmethod(lambda: priority_range)
+        torch.cuda.Stream,
+        "priority_range",
+        staticmethod(lambda: priority_range),
+        raising=False,
     )
     assert (
         streaming_vocoder.vocoder_decode_stream_priority(torch.cuda)

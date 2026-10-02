@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from sglang.srt.hardware_backend.mlx import runtime as mlx_runtime
 from sglang.srt.runtime_context import get_context
 
 from sglang_omni.config.manager import ConfigManager
@@ -6993,6 +6994,7 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_fake_sglang(monkeypatch)
+    monkeypatch.setattr(mlx_runtime, "use_mlx", lambda: False)
     from transformers import AutoProcessor
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
     from transformers.utils import generic
