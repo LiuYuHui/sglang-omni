@@ -14,8 +14,15 @@ from dataclasses import asdict
 from pathlib import Path
 
 from benchmarks.benchmarker.fingerprint import collect_environment_fingerprint
-from benchmarks.eval.personaplex_profiling_report import build_component_report
-from benchmarks.eval.personaplex_profiling_workload import measure_pass, measure_request
+from benchmarks.eval.personaplex_profiling_report import (
+    ComponentReport,
+    build_component_report,
+)
+from benchmarks.eval.personaplex_profiling_workload import (
+    PassMeasurement,
+    measure_pass,
+    measure_request,
+)
 from sglang_omni.client.client import Client
 from sglang_omni.client.types import GenerateRequest, SamplingParams
 from sglang_omni.config.manager import ConfigManager
@@ -23,10 +30,92 @@ from sglang_omni.models.personaplex.config import PersonaPlexPipelineConfig
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
-from sglang_omni.profiler.views import build_report
+from sglang_omni.profiler.views import ProfilerReport, build_report, format_table
 from sglang_omni.proto.request import EXPLICIT_GENERATION_PARAMS_KEY
 
 PROFILER_POLL_SECONDS = 0.1
+
+
+def format_summary(
+    baseline: PassMeasurement,
+    profiled: PassMeasurement,
+    outputs_match: bool,
+    component_report: ComponentReport,
+    request_report: ProfilerReport,
+) -> str:
+    request_rows: list[dict[str, str | int | float]] = [
+        {
+            "Request": request.request_id,
+            "Latency (ms)": f"{request.latency_milliseconds:.3f}",
+            "First audio (ms)": f"{request.time_to_first_audio_milliseconds:.3f}",
+            "RTF": f"{request.real_time_factor:.3f}",
+        }
+        for measurement in (baseline, profiled)
+        for request in measurement.requests
+    ]
+    cost_columns = ["CPU scope", "GPU kernels", "CUDA launch", "CUDA sync", "GPU copy"]
+    component_rows: list[dict[str, str | int | float]] = []
+    for component in component_report["components"]:
+        durations_milliseconds = [
+            component["cpu_scope_milliseconds"],
+            component["gpu_kernel_milliseconds"],
+            component["cuda_launch_milliseconds"],
+            component["cuda_synchronization_milliseconds"],
+            component["gpu_transfer_milliseconds"],
+        ]
+        component_rows.append(
+            {
+                "Component": component["name"].removeprefix("personaplex."),
+                **{
+                    column: (
+                        "N/A"
+                        if duration_milliseconds is None
+                        else f"{duration_milliseconds:.3f}"
+                    )
+                    for column, duration_milliseconds in zip(
+                        cost_columns, durations_milliseconds, strict=True
+                    )
+                },
+            }
+        )
+    queue_rows = [
+        row
+        for row in request_report["stage_breakdown"]
+        if row["interval"]
+        in (
+            "scheduler_queue_enter->scheduler_prefill_start",
+            "stage_dispatch->preprocess_start",
+            "stage_dispatch->encoder_start",
+        )
+    ]
+    lines = [
+        "\nPersonaPlex profiling summary",
+        f"Wall time: baseline {baseline.wall_seconds:.3f}s; profiled {profiled.wall_seconds:.3f}s; ratio {profiled.wall_seconds / baseline.wall_seconds:.3f}x",
+        f"Outputs match: {outputs_match}; recorded requests: {request_report['request_count']}/{len(profiled.requests)}",
+        "\nRequests (RTF = latency / output audio duration):",
+        format_table(
+            request_rows, ["Request", "Latency (ms)", "First audio (ms)", "RTF"]
+        ),
+        "Components (ms across the profiled pass; N/A = missing scope):",
+        format_table(component_rows, ["Component", *cost_columns]),
+        f"Unattributed GPU work: kernels {component_report['unattributed_gpu_kernel_milliseconds']:.3f}ms; copies {component_report['unattributed_gpu_transfer_milliseconds']:.3f}ms; memset {component_report['unattributed_gpu_memset_milliseconds']:.3f}ms",
+        *[
+            f"GPU {device['host_name']}:{device['device_id']}: window {device['window_milliseconds']:.3f}ms; busy {device['gpu_busy_milliseconds']:.3f}ms; idle {device['gpu_idle_milliseconds']:.3f}ms ({device['window_source']})"
+            for device in component_report["devices"]
+        ],
+        "\nQueue waits (ms; LM admission and dispatch-to-compute):",
+        format_table(queue_rows, ["stage", "count", "total_ms", "avg_ms", "max_ms"]),
+        "Stage hops (ms; IPC, payload materialization and receiver scheduling):",
+        format_table(
+            request_report["hop_breakdown"],
+            ["src", "dst", "kind", "count", "avg_ms", "max_ms"],
+        ),
+        "Use baseline latency for performance; profiled timings include recording overhead.",
+        "CPU scopes, launches, synchronization, GPU work and waits overlap; do not add them.",
+        "GPU idle includes host scheduling; it is not pure launch overhead.",
+        "Streaming Mimi per-chunk queue time is unavailable.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def parse_args() -> argparse.Namespace:
@@ -285,10 +374,14 @@ async def run(arguments: argparse.Namespace) -> int:
         ],
     }
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"Report: {report_path}")
-    print(
-        f"Profiled/unprofiled wall time: {report['profiler_wall_time_ratio']:.3f}; outputs match: {outputs_match}"
+    summary = format_summary(
+        baseline, profiled, outputs_match, component_report, request_report
     )
+    summary_path = run_directory / "summary.txt"
+    summary_path.write_text(summary, encoding="utf-8")
+    print(summary, end="")
+    print(f"Report: {report_path}")
+    print(f"Summary: {summary_path}")
     if not outputs_match:
         return 1
     elif (
