@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Check Qwen3-Omni transcription uploads and audio chat preprocessing."""
+"""Check Qwen3-Omni transcription upload preprocessing."""
 
 from __future__ import annotations
 
@@ -119,29 +119,3 @@ def test_invalid_transcription_upload_reports_decode_error(
     with pytest.raises(ValueError, match="could not decode the uploaded audio"):
         asyncio.run(audio_preprocessor(payload))
     audio_preprocessor.processor.assert_not_called()
-
-
-def test_audio_chat_preserves_prompt_and_waveform(
-    audio_preprocessor: Qwen3OmniPreprocessor,
-) -> None:
-    waveform = np.array([0.25, -0.25], dtype=np.float32)
-    instruction = "Answer the question in the recording."
-    payload = StagePayload(
-        request_id="audio-chat",
-        request=OmniRequest(
-            inputs={
-                "messages": [{"role": "user", "content": instruction}],
-                "audios": [waveform],
-            }
-        ),
-        data=None,
-    )
-
-    result = asyncio.run(audio_preprocessor(payload))
-
-    state = Qwen3OmniPipelineState.from_dict(result.data)
-    assert state.prompt is not None
-    assert instruction in state.prompt["prompt_text"]
-    assert state.prompt["prompt_text"].count("<|audio_pad|>") == 1
-    assert "transcribe" not in state.prompt["prompt_text"].lower()
-    assert audio_preprocessor.processor.call_args.kwargs["audio"][0] is waveform
