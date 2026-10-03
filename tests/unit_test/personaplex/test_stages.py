@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Preprocessing resolves the caller channel, the role prompt and the voice per request."""
 
+from pathlib import Path
 from unittest.mock import Mock
 
 import numpy as np
@@ -16,6 +17,13 @@ from sglang_omni.models.personaplex.prompts import (
     VoicePrompt,
     tokenize_text_prompt,
 )
+from sglang_omni.profiler.event_recorder import (
+    emit,
+    get_recorder,
+    reset_active_stage,
+    set_active_stage,
+)
+from sglang_omni.profiler.views import build_report
 from sglang_omni.proto import StagePayload
 from sglang_omni.proto.request import OmniRequest
 from sglang_omni.serve.openai_errors import is_bad_request_error
@@ -195,6 +203,72 @@ def test_mimi_encode_fills_caller_and_voice_codes(monkeypatch):
 
     no_voice = run(PersonaPlexState(waveform=torch.ones(SAMPLES_PER_FRAME)))
     assert no_voice.user_codes.shape == (1, 8) and no_voice.voice_codes is None
+
+
+def test_preprocessing_records_stage_compute_interval(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> None:
+    preprocess = request.getfixturevalue("preprocess")
+    recorder = get_recorder()
+    recorder.start(run_id="preprocess-profile", event_dir=str(tmp_path), stage="shared")
+    stage_token = set_active_stage("preprocessing")
+    try:
+        emit(request_id="r", stage=None, event_name="stage_dispatch")
+        state = preprocess()
+    finally:
+        reset_active_stage(stage_token)
+        recorder.stop()
+    assert state.num_samples == CALLER_SAMPLES
+    report = build_report(tmp_path)
+    assert report["request_count"] == 1
+    intervals = report["stage_breakdown"]
+    assert len(intervals) == 2
+    assert {interval["interval"] for interval in intervals} == {
+        "stage_dispatch->preprocess_start",
+        "preprocess_start->preprocess_end",
+    }
+    assert all(interval["stage"] == "preprocessing" for interval in intervals)
+    assert all(interval["count"] == 1 for interval in intervals)
+
+
+def test_mimi_encoder_records_stage_compute_interval(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ProfilingCodec:
+        def encode(self, waveform: torch.Tensor) -> torch.Tensor:
+            frames = waveform.shape[-1] // SAMPLES_PER_FRAME
+            return torch.zeros(1, 8, frames, dtype=torch.long)
+
+    monkeypatch.setattr(
+        stages, "load_codec", Mock(return_value=(ProfilingCodec(), "cpu"))
+    )
+    scheduler = stages.create_mimi_encode_executor("m")
+    state = PersonaPlexState(waveform=torch.ones(2 * SAMPLES_PER_FRAME))
+    payload = StagePayload(
+        "encoder-profile",
+        request=OmniRequest(inputs={}, params={}),
+        data=state.to_dict(),
+    )
+    recorder = get_recorder()
+    recorder.start(run_id="encoder-profile", event_dir=str(tmp_path), stage="shared")
+    stage_token = set_active_stage("mimi_encode")
+    try:
+        emit(request_id=payload.request_id, stage=None, event_name="stage_dispatch")
+        result = PersonaPlexState.from_dict(scheduler.fn(payload).data)
+    finally:
+        reset_active_stage(stage_token)
+        recorder.stop()
+    assert result.user_codes.shape == (2, 8)
+    report = build_report(tmp_path)
+    assert report["request_count"] == 1
+    intervals = report["stage_breakdown"]
+    assert len(intervals) == 2
+    assert {interval["interval"] for interval in intervals} == {
+        "stage_dispatch->encoder_start",
+        "encoder_start->encoder_end",
+    }
+    assert all(interval["stage"] == "mimi_encode" for interval in intervals)
+    assert all(interval["count"] == 1 for interval in intervals)
 
 
 @pytest.mark.parametrize(
