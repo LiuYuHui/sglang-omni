@@ -65,46 +65,25 @@ python -m benchmarks.eval.personaplex_profiling \
     --lm.engine.attention_backend triton
 ```
 
-This example fits the BF16 model on a 24 GiB CUDA device with a short recording.
-Adjust memory and context settings for the device, prompt, and recording length.
-The LM admits one request at a time; concurrent requests expose admission queueing.
-Run short, medium, and long caller recordings separately to compare workloads.
-The profiler requires a torch build supporting
-`torch._C._profiler._ExperimentalConfig(profile_all_threads=True)` because model
-execution runs on worker threads. Unsupported builds fail explicitly. The CLI
-enables `SGLANG_TORCH_PROFILER_PROFILE_ALL_THREADS=1` before starting workers;
-ordinary serving keeps its existing profiler settings.
+The example targets a 24 GiB CUDA device with a short recording; adjust memory and
+context settings for your workload. Requires a torch build supporting profiling
+all worker threads. The LM admits one request at a time, so concurrency exposes
+admission queueing.
 
-Each invocation creates a unique directory containing `report.json`, request event
-JSONL files, and one compressed Chrome trace per worker process. Open decompressed
-traces in Perfetto or another Chrome trace viewer. Co-located stages share a trace;
-the `personaplex.*` scopes identify component ownership. Startup and a default one
-request warmup are excluded from measurements. The two measured passes use the
-same recording, voice, role prompt, seed, and greedy text/audio sampling.
+After a default one-request warmup, the script runs the same input with greedy
+sampling, first unprofiled and then profiled. Each run writes `report.json`, event
+JSONL files, and compressed Chrome traces to a unique output directory. View
+decompressed traces in Perfetto.
 
-The report provides:
+The report includes:
 
-- Unprofiled/profiled request latency, time to first audio chunk, real-time factor,
-  throughput, and the profiler wall-time ratio.
-- Exact full text and float32 waveform comparisons between the two passes, plus
-  agreement between streamed audio and the terminal waveform. A mismatch fails
-  the command while retaining the report.
-- Separate CPU scope, CUDA launch, CUDA synchronization, GPU kernel, and GPU
-  transfer durations for Temporal Transformer, text logits, Depformer, Mimi
-  encoding/decoding, embeddings, H2D, and D2H. GPU memset is reported separately.
-- GPU busy/idle interval unions, unattributed activity, missing component scopes,
-  and kernel/transfer attribution coverage. Missing scopes remain null and fail
-  the command; they are never reported as zero cost.
-- Request timelines, preprocessing/Mimi compute intervals, stage admission waits,
-  LM admission queueing, and stage-to-stage payload/stream hop latency.
+- CPU scopes, CUDA launch/synchronization, and GPU kernel/copy costs for Temporal
+  Transformer, logits, Depformer, Mimi, embeddings, H2D, and D2H; GPU memset,
+  busy/idle time, and attribution coverage are reported separately.
+- Request latency, first-audio latency, RTF, throughput, and stage/queue/hop timing.
+- Full text and float32 audio parity, streamed/terminal audio agreement, and
+  profiler overhead. Output mismatches or missing component scopes fail the run.
 
-CPU scopes describe launch-side elapsed time and may include synchronization;
-their CUDA kernels can run after the scopes end. Kernels are attributed through
-CUDA correlation and CPU external ids, including across worker threads. These
-durations overlap and **must not be added into a disjoint latency total**. GPU idle
-also includes host scheduling and other waiting, so it does not measure pure
-launch overhead. Stage hop latency includes IPC, payload materialization, and
-receiver scheduling; H2D/D2H scopes and GPU memcpy events describe device transfers.
-Streaming Mimi scheduler waits are visible in hop and stage timing, without a
-separate per-chunk scheduler queue metric. Use unprofiled latency for performance
-claims and inspect the profiler overhead ratio before interpreting a bottleneck.
+**Timing metrics overlap; do not sum them.** Use unprofiled latency for performance
+comparisons. GPU idle includes host scheduling/waiting; hop latency includes IPC
+and receiver scheduling. Streaming Mimi has no separate per-chunk queue metric.
