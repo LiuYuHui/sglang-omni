@@ -59,12 +59,18 @@ def audio_preprocessor() -> Qwen3OmniPreprocessor:
 
 
 @pytest.mark.parametrize(
-    "language,context", [(None, None), ("en", "SGLang and Qwen3-Omni")]
+    "language,context,expected_language",
+    [
+        (None, None, None),
+        ("en", "SGLang and Qwen3-Omni", "English"),
+        ("custom-language", "SGLang and Qwen3-Omni", "custom-language"),
+    ],
 )
 def test_transcription_upload_decodes_audio_and_sets_task(
     audio_preprocessor: Qwen3OmniPreprocessor,
     language: str | None,
     context: str | None,
+    expected_language: str | None,
 ) -> None:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as audio_file:
@@ -92,8 +98,8 @@ def test_transcription_upload_decodes_audio_and_sets_task(
     assert "original language" in prompt_text
     assert "only the transcription" in prompt_text
     assert prompt_text.count("<|audio_pad|>") == 1
-    if language is not None:
-        assert f"The spoken language is {language}." in prompt_text
+    if expected_language is not None:
+        assert f"The spoken language is {expected_language}." in prompt_text
         assert f"Transcription context: {context}" in prompt_text
     else:
         assert "The spoken language is" not in prompt_text
