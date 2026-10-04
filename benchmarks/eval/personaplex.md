@@ -50,3 +50,19 @@ its emulated result is not proof that the unmodified implementations match.
 `personaplex_reference_dump.py` runs under the reference interpreter and regenerates
 the dump on every invocation. Large dumps, checkpoints and generated audio belong
 in external result directories.
+
+## Depformer pointwise fusion
+
+CUDA inference uses one CuTe DSL kernel per weighted RMSNorm and one per SiLU/gate
+operation for contiguous, singleton tensors at the production dimensions
+(hidden size 1024 and FFN hidden size 2816), in FP32, BF16 or FP16. Each request
+spells its own frame with batch size 1, including when serving multiple requests.
+RMSNorm retains FP32 accumulation, epsilon inside the square root,
+the multiplication order `x * (alpha * rsqrt(variance))`, and the final input
+dtype cast. At the production hidden size, its reduction follows the pinned
+PyTorch FP32 mean's accumulation order. SiLU rounds to the projection dtype
+before multiplying by the up projection, including for BF16 and FP16.
+CPU, other devices, gradient-enabled calls, other batch sizes or dimensions,
+and non-contiguous tensors retain the eager operations. The LM stage warms the
+singleton kernels during startup. Cached TVM FFI launches accept PyTorch
+tensors directly and use the current PyTorch CUDA stream.
