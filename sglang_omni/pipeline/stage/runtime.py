@@ -521,6 +521,14 @@ class Stage:
     async def on_submit(self, msg: SubmitMessage) -> None:
         request_id = msg.request_id
         if request_id in self.aborted:
+            # A new coordinator admission needs an explicit answer. Late
+            # downstream data still follows the silent stale-result path. The
+            # message keeps the duplicate ID form so both map to one status.
+            await self.send_failure(
+                request_id,
+                f"Request {request_id} (retired after abort or failure, use a "
+                "fresh request ID) already exists",
+            )
             return
         else:
             pass
@@ -2117,15 +2125,17 @@ class Stage:
             raise RuntimeError(f"Follower stage {self.name} failed: {error}")
         else:
             pass
-        await self.control_plane.send_complete(
-            CompleteMessage(
-                request_id=request_id,
-                from_stage=self.name,
-                success=False,
-                error=error,
+        try:
+            await self.control_plane.send_complete(
+                CompleteMessage(
+                    request_id=request_id,
+                    from_stage=self.name,
+                    success=False,
+                    error=error,
+                )
             )
-        )
-        self.clear_request_state(request_id)
+        finally:
+            self.clear_request_state(request_id)
 
     def clear_request_state(self, request_id: str) -> None:
         self.active_requests.discard(request_id)
