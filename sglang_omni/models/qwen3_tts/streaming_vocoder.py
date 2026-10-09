@@ -240,6 +240,7 @@ class DecodeSlot:
         CPU codes [B, Q, T] -> input_codes (pinned) -> CUDA decoder
         CUDA audio deltas [S] -> output_transfer (pinned + completion event)
             -> independent CPU tensors (not pinned)
+        CUDA invalid-row mask [B] -> invalid_rows (pinned, fenced by the same event)
 
     ``busy`` is set from acquisition until the handle that owns the slot
     releases it. ``broken`` is sticky: the slot is never acquired, grown, or
@@ -249,6 +250,7 @@ class DecodeSlot:
     """
 
     input_codes: GrowablePinnedBuffer
+    invalid_rows: GrowablePinnedBuffer
     output_transfer: PinnedTransferSlot
     busy: bool = False
     broken: bool = False
@@ -1339,7 +1341,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         codes_ready = state.pending_codes_ready
         state.pending_codes_ready = None
         if codes_ready is None and supports_device_streams(codes.device):
-            codes_ready = self.device_module.Event()
+            codes_ready = torch.get_device_module(codes.device).Event()
             codes_ready.record()
         else:
             pass
@@ -1745,7 +1747,8 @@ class Qwen3TTSStreamingVocoderScheduler(
 
         Asynchronous CUDA path:
             stage CPU input -> run decoder -> extract audio deltas
-            -> copy deltas into the thread's pinned slot -> record its event
+            -> copy deltas and the invalid-row mask into the thread's pinned slot
+            -> record its event
 
         Return behavior:
             asynchronous CUDA path -> return a pending handle that owns the slot
@@ -1958,6 +1961,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
             )
             * self.samples_per_frame,
+            row_count=len(plans),
         )
         gpu_input: torch.Tensor | None = None
         keepalives: list[torch.Tensor] = []
@@ -1990,6 +1994,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 keepalives.extend(deltas)
                 if not pinned:
                     host = [delta.contiguous().cpu() for delta in deltas]
+                    bad_rows = bad_rows.cpu()
                     stream.synchronize()
                     return Qwen3TTSDecodeHandle(
                         host,
@@ -2001,10 +2006,13 @@ class Qwen3TTSStreamingVocoderScheduler(
                 else:
                     pass
                 staged = self.stage_deltas(deltas, slot)
+                keepalives.append(bad_rows)
+                host_bad_rows = slot.invalid_rows.view(len(plans))
+                host_bad_rows.copy_(bad_rows, non_blocking=True)
                 slot.output_transfer.record(stream)
             return Qwen3TTSDecodeHandle(
                 staged,
-                bad_rows,
+                host_bad_rows,
                 slot=slot,
                 owner=self,
                 stream=stream,
@@ -2059,6 +2067,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 (
                     DecodeSlot(
                         input_codes=GrowablePinnedBuffer(torch.long),
+                        invalid_rows=GrowablePinnedBuffer(torch.bool),
                         output_transfer=PinnedTransferSlot(slot_device, torch.float32),
                     )
                     for _ in range(2)
@@ -2075,7 +2084,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         return slots[0]
 
     def reserve_slot(
-        self, slot: DecodeSlot, *, input_numel: int, output_numel: int
+        self, slot: DecodeSlot, *, input_numel: int, output_numel: int, row_count: int
     ) -> bool:
         """Grow and acquire the thread's slot before any async work is enqueued.
 
@@ -2094,6 +2103,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             pass
         try:
             slot.input_codes.ensure_capacity(input_numel)
+            slot.invalid_rows.ensure_capacity(row_count)
             slot.output_transfer.ensure_capacity(output_numel)
         except RuntimeError:
             self.pinned_staging_disabled = True
@@ -2897,6 +2907,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         else:
             pass
         while True:
+            self.commit_decoded_incremental()
             in_flight = bool(getattr(self.worker_ctx, "pending_incremental", None))
             if in_flight:
                 if not self.followup_collect_lock.acquire(
@@ -2996,10 +3007,19 @@ class Qwen3TTSStreamingVocoderScheduler(
                 else:
                     planned.append((request_id, state, plan))
         stream = getattr(self.worker_ctx, "stream", self.followup_decode_stream)
-        for cohort in self.group_decode_plans(planned_incremental):
+        # note (Haoling Pu): earliest cohort first, its earliest rows in the first group.
+        cohorts = sorted(
+            (
+                sorted(cohort, key=lambda entry: entry[1].playback_deadline_s)
+                for cohort in self.group_decode_plans(planned_incremental)
+            ),
+            key=lambda cohort: cohort[0][1].playback_deadline_s,
+        )
+        for cohort in cohorts:
             for group in self.split_incremental_group_for_graph(
                 cohort, runner=getattr(self.worker_ctx, "incremental_graphs", None)
             ):
+                self.commit_decoded_incremental()
                 self.drain_pending_incremental(keep=1)
                 pending = self.launch_incremental_group(group, stream=stream)
                 if pending is not None:
@@ -3031,6 +3051,32 @@ class Qwen3TTSStreamingVocoderScheduler(
         else:
             pass
         return pending
+
+    def commit_decoded_incremental(self) -> None:
+        """Commit the oldest in-flight cohorts that are ready to resolve."""
+        pending = self.pending_incremental()
+        ready_count = 0
+        for in_flight_group in pending:
+            slot = in_flight_group.handle.slot
+            if slot is None:
+                is_ready = True
+            else:
+                try:
+                    is_ready = slot.output_transfer.query()
+                except RuntimeError:
+                    logger.warning(
+                        "Qwen3-TTS follow-up decode event query failed; resolving the cohort now",
+                        exc_info=True,
+                    )
+                    is_ready = True
+            if is_ready:
+                ready_count += 1
+            else:
+                break
+        if ready_count > 0:
+            self.drain_pending_incremental(keep=len(pending) - ready_count)
+        else:
+            pass
 
     def drain_pending_incremental(self, *, keep: int) -> None:
         """Resolve and commit the oldest in-flight cohorts down to ``keep``."""
