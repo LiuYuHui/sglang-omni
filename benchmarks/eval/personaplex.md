@@ -55,8 +55,8 @@ in external result directories.
 
 CUDA inference uses one CuTe DSL kernel per weighted RMSNorm and one per SiLU/gate
 operation for contiguous, singleton tensors at the production dimensions
-(hidden size 1024 and FFN hidden size 2816), in FP32, BF16 or FP16. Each request
-spells its own frame with batch size 1, including when serving multiple requests.
+(hidden size 1024 and FFN hidden size 2816), in FP32, BF16 or FP16. Compatible
+requests share a Depformer pass; passes with multiple requests use eager operations.
 RMSNorm retains FP32 accumulation, epsilon inside the square root,
 the multiplication order `x * (alpha * rsqrt(variance))`, and the final input
 dtype cast. At the production hidden size, its reduction follows the pinned
