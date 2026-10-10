@@ -45,12 +45,12 @@ from sglang_omni.preprocessing.resource_connector import (
     ResourceHTTPConnection,
     await_media_cleanup,
 )
-from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.preprocessing.text import (
     MediaPlaceholderPart,
     TextContentPart,
     split_content_parts,
 )
+from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.utils.audio import AudioDecodeError
