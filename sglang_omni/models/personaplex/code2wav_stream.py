@@ -8,6 +8,7 @@ arrive: 1920 samples per 80 ms frame, no holdback.
 
 from __future__ import annotations
 
+from itertools import groupby
 from typing import Protocol
 
 import torch
@@ -15,8 +16,9 @@ import torch
 from sglang_omni.models.personaplex.architecture import SAMPLE_RATE
 from sglang_omni.models.personaplex.mimi_decode_graph import DecodeSlot, MimiDecodeSlots
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import StagePayload
-from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
@@ -48,11 +50,15 @@ class StreamState:
 
 
 class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
+    can_batch_stream_chunks: bool = True
+    stream_chunk_batch_distinct_requests: bool = True
+
     def __init__(
         self, decode_slots: MimiDecodeSlots, *, compute_fn: AudioPayloadDecoder
     ) -> None:
         super().__init__(compute_fn)
         self.decode_slots = decode_slots
+        self.stream_chunk_batch_max: int = decode_slots.max_batch_size
         self.stream_states: dict[str, StreamState] = {}
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
@@ -83,14 +89,71 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
 
     @torch.inference_mode()
     def on_stream_chunk(
-        self, request_id: str, item: IncomingMessage
+        self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
+        codes = self.codes_from_chunk(item).to(device=self.decode_slots.codec.device)
         state = self.stream_state(request_id)
-        codes_FK = torch.as_tensor(
-            item.data, dtype=torch.long, device=self.decode_slots.codec.device
-        )
-        waveform = self.decode_slots.decode_step(codes_FK.T[None], state.decode_slot)
+        waveform = self.decode_slots.decode_step(codes.T[None], state.decode_slot)
         waveform = waveform[0, 0].float().cpu()
+        return [self.waveform_message(request_id, state, item, waveform)]
+
+    @torch.inference_mode()
+    def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
+        with self.state_lock:
+            chunks = [
+                (request_id, item, self.codes_from_chunk(item))
+                for request_id, item in items
+            ]
+            for _, group in groupby(
+                chunks, key=lambda chunk: (chunk[2].shape[0], chunk[2].device)
+            ):
+                chunks = [chunk for chunk in group if not self.is_aborted(chunk[0])]
+                if not chunks:
+                    continue
+                else:
+                    pass
+                try:
+                    states = [
+                        self.stream_state(request_id) for request_id, _, _ in chunks
+                    ]
+                    codes = torch.stack([codes.T for _, _, codes in chunks]).to(
+                        device=self.decode_slots.codec.device
+                    )
+                    waveforms = (
+                        self.decode_slots.decode_batch(
+                            codes, [state.decode_slot for state in states]
+                        )
+                        .float()
+                        .cpu()
+                    )
+                except Exception as exc:
+                    for request_id, _, _ in chunks:
+                        if not self.is_aborted(request_id):
+                            self.emit_error(request_id, exc)
+                            self.abort(request_id)
+                        else:
+                            pass
+                    continue
+                for (request_id, item, _), state, waveform in zip(
+                    chunks, states, waveforms[:, 0], strict=True
+                ):
+                    message = self.waveform_message(request_id, state, item, waveform)
+                    if not self.is_aborted(request_id):
+                        self.outbox.put(message)
+                    else:
+                        pass
+
+    def codes_from_chunk(self, item: StreamItem) -> torch.Tensor:
+        assert isinstance(item.data, torch.Tensor)
+        return item.data.to(dtype=torch.long)
+
+    def waveform_message(
+        self,
+        request_id: str,
+        state: StreamState,
+        item: StreamItem,
+        waveform: torch.Tensor,
+    ) -> OutgoingMessage:
         # Note (wilsonzheng0327): The terminal payload only arrives after the LM finishes,
         # so the caller length travels with each chunk.
         num_samples = int((item.metadata or {}).get("num_samples") or 0)
@@ -100,19 +163,17 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
             pass
         state.emitted += waveform.shape[-1]
         state.audio_parts.append(waveform)
-        return [
-            OutgoingMessage(
-                request_id=request_id,
-                type="stream",
-                data=audio_waveform_payload(
-                    waveform,
-                    sample_rate=SAMPLE_RATE,
-                    modality="audio",
-                    source_hint=SOURCE_HINT,
-                ),
-                metadata={"modality": "audio"},
-            )
-        ]
+        return OutgoingMessage(
+            request_id=request_id,
+            type="stream",
+            data=audio_waveform_payload(
+                waveform,
+                sample_rate=SAMPLE_RATE,
+                modality="audio",
+                source_hint=SOURCE_HINT,
+            ),
+            metadata={"modality": "audio"},
+        )
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
         state = self.stream_states.get(request_id)

@@ -1,25 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Chunked Mimi must land on the samples a whole-sequence pass produces."""
+"""Mimi streaming preserves waveforms and independent stream state."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import sglang_omni.models.personaplex.mimi_decode_graph as mimi_decode_graph
 from sglang_omni.models.personaplex.architecture import MIMI
 from sglang_omni.models.personaplex.components.causal_conv import (
     CausalConv1d,
     CausalConvTranspose1d,
 )
-from sglang_omni.models.personaplex.components.mimi import (
-    MimiCodec,
-    MimiDecodeState,
-    rename_mimi_key,
-)
+from sglang_omni.models.personaplex.components.mimi import MimiCodec, rename_mimi_key
+from sglang_omni.models.personaplex.components.mimi_state import MimiDecodeState
 from sglang_omni.models.personaplex.components.mimi_transformer import (
     MimiAttention,
     MimiTransformer,
 )
+from sglang_omni.models.personaplex.mimi_decode_graph import MimiDecodeSlots
+from sglang_omni.platforms import current_platform
 
 
 def test_causal_conv_chunks_match_whole():
@@ -181,3 +182,117 @@ def test_whole_sequence_matches_the_streaming_replay(length):
             -1,
         )
     torch.testing.assert_close(whole, chunked, atol=1e-6, rtol=1e-5)
+
+
+def compare_staggered_decode_batches(
+    codec: MimiCodec, slots: MimiDecodeSlots, *, use_batched_reference: bool = False
+) -> None:
+    generator = torch.Generator().manual_seed(12)
+    stream_lengths = [
+        codec.spec.context // codec.spec.frame_ratio + 17 + 3 * i for i in range(8)
+    ]
+    codes = [
+        torch.randint(
+            codec.spec.codebook_size,
+            (1, codec.spec.num_codebooks, frames),
+            generator=generator,
+        ).to(codec.device)
+        for frames in stream_lengths
+    ]
+    for _ in range(2):
+        decode_slots = [slots.acquire() for _ in range(8)]
+        reference_pool = (
+            codec.init_decode_state(batch_size=8) if use_batched_reference else None
+        )
+        references = (
+            []
+            if use_batched_reference
+            else [codec.init_decode_state(batch_size=1) for _ in range(8)]
+        )
+        positions = [0] * 8
+        tick = 0
+        while positions != stream_lengths:
+            groups: dict[int, list[int]] = {}
+            for stream_index in reversed(range(8)):
+                if (
+                    tick >= stream_index
+                    and positions[stream_index] < stream_lengths[stream_index]
+                ):
+                    width = min(
+                        tick % 3 + 1,
+                        stream_lengths[stream_index] - positions[stream_index],
+                    )
+                    groups.setdefault(width, []).append(stream_index)
+                else:
+                    pass
+            for width, stream_indices in groups.items():
+                chunks = [
+                    codes[i][..., positions[i] : positions[i] + width]
+                    for i in stream_indices
+                ]
+                batch_codes = torch.cat(chunks)
+                waveforms = slots.decode_batch(
+                    batch_codes, [decode_slots[i] for i in stream_indices]
+                ).clone()
+                if reference_pool is not None:
+                    row_indices = torch.tensor(stream_indices, device=codec.device)
+                    reference_state = reference_pool.select_rows(row_indices)
+                    expected = codec.decode_step(batch_codes, reference_state)
+                    reference_pool.copy_rows(row_indices, reference_state)
+                    torch.testing.assert_close(waveforms, expected, atol=0, rtol=0)
+                else:
+                    for batch_row, stream_index in enumerate(stream_indices):
+                        expected = codec.decode_step(
+                            chunks[batch_row], references[stream_index]
+                        )
+                        torch.testing.assert_close(
+                            waveforms[batch_row : batch_row + 1],
+                            expected,
+                            atol=1e-5,
+                            rtol=1e-5,
+                        )
+                for stream_index in stream_indices:
+                    positions[stream_index] += width
+            tick += 1
+        for slot in decode_slots:
+            slots.release(slot)
+
+
+def test_platforms_without_codec_decode_graphs_decode_and_reuse_fresh_states(
+    small_codec: MimiCodec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        mimi_decode_graph,
+        "current_platform",
+        SimpleNamespace(enable_codec_decode_graph=lambda: False),
+    )
+    slots = MimiDecodeSlots(small_codec, num_slots=8, max_graph_frames=1)
+    compare_staggered_decode_batches(small_codec, slots)
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("allow_tf32", [False, True])
+@pytest.mark.skipif(
+    not current_platform.enable_codec_decode_graph(),
+    reason="the platform does not capture codec decode graphs",
+)
+def test_graph_replay_matches_eager_decode_across_staggered_batches_and_slot_reuse(
+    random_codec: MimiCodec, allow_tf32: bool
+) -> None:
+    # Note (edwardzh): TF32 convolution rounding depends on batch size.
+    with torch.backends.cudnn.flags(allow_tf32=allow_tf32):
+        codec = random_codec.cuda()
+        slots = MimiDecodeSlots(codec, num_slots=8, max_graph_frames=2)
+        compare_staggered_decode_batches(codec, slots, use_batched_reference=allow_tf32)
+        pooled = [slots.acquire() for _ in range(8)]
+        overflow = slots.acquire()
+        codes = torch.zeros(2, 8, 1, dtype=torch.long, device=codec.device)
+        expected = codec.decode(codes)
+        torch.testing.assert_close(
+            slots.decode_batch(codes, [pooled[5], overflow]),
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        for slot in [*pooled, overflow]:
+            slots.release(slot)

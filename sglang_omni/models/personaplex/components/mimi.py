@@ -10,7 +10,6 @@ kept wherever the module tree allows so loading stays a rename, not a rewrite.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -24,17 +23,14 @@ from sglang_omni.models.personaplex.components.causal_conv import (
     ELU,
     CausalConv1d,
     CausalConvTranspose1d,
-    ConvState,
-    ConvTransposeState,
     StreamingModule,
 )
-from sglang_omni.models.personaplex.components.mimi_transformer import (
-    MimiTransformer,
-    TransformerState,
+from sglang_omni.models.personaplex.components.mimi_state import (
+    MimiDecodeState,
+    MimiEncodeState,
+    SEANetState,
 )
-
-SEANetLayerState = ConvState | ConvTransposeState | None
-SEANetState = list[SEANetLayerState | list[SEANetLayerState]]
+from sglang_omni.models.personaplex.components.mimi_transformer import MimiTransformer
 
 
 class SEANetResnetBlock(StreamingModule):
@@ -77,16 +73,6 @@ def run_stack(modules: nn.ModuleList, x: torch.Tensor) -> torch.Tensor:
 
 def stack_state(modules: nn.ModuleList, batch_size: int) -> SEANetState:
     return [m.init_state(batch_size) for m in modules]
-
-
-def reset_stack(state: SEANetState) -> None:
-    for module_state in state:
-        if isinstance(module_state, list):
-            reset_stack(module_state)
-        elif module_state is not None:
-            module_state.reset()
-        else:
-            pass
 
 
 def step_stack(
@@ -253,26 +239,6 @@ class SplitResidualVectorQuantizer(nn.Module):
         return quantized
 
 
-@dataclass
-class MimiEncodeState:
-    encoder: SEANetState
-    transformer: TransformerState
-    downsample: ConvState
-
-
-@dataclass
-class MimiDecodeState:
-    upsample: ConvTransposeState
-    transformer: TransformerState
-    decoder: SEANetState
-
-    def reset(self) -> None:
-        """Back to a fresh stream, in place, so captured graphs keep their addresses."""
-        self.upsample.reset()
-        self.transformer.reset()
-        reset_stack(self.decoder)
-
-
 class MimiCodec(nn.Module):
     def __init__(self, spec: MimiSpec = MIMI) -> None:
         super().__init__()
@@ -421,8 +387,6 @@ def load_mimi_codec(
 
 __all__ = [
     "MimiCodec",
-    "MimiDecodeState",
-    "MimiEncodeState",
     "load_mimi_codec",
     "rename_mimi_key",
     "resolve_mimi_weights",

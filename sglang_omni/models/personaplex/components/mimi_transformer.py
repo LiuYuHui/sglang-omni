@@ -22,15 +22,16 @@ def apply_interleaved_rope(
 
     Args:
         q, k: [B, H, T, D].
-        positions: [T] absolute positions.
+        positions: [T] or [B, T] absolute positions.
     """
     dim = q.shape[-1]
     freqs = torch.exp(
         torch.arange(dim // 2, device=q.device, dtype=torch.float32)
         * (-math.log(max_period) * 2 / dim)
     )
-    angles = positions.to(torch.float32).view(-1, 1) * freqs
-    cos, sin = torch.cos(angles), torch.sin(angles)
+    angles = positions.to(torch.float32).unsqueeze(-1) * freqs
+    cos = torch.cos(angles).unsqueeze(-3)
+    sin = torch.sin(angles).unsqueeze(-3)
 
     def rotate(x: torch.Tensor) -> torch.Tensor:
         pairs = x.float().view(*x.shape[:-1], dim // 2, 2)
@@ -94,7 +95,12 @@ class MimiAttention(nn.Module):
         q, k, v = rearrange(
             projected, "b t (p h d) -> p b h t d", p=3, h=self.num_heads
         )
-        pos_q = offset + torch.arange(length, device=x.device)
+        positions = torch.arange(length, device=x.device)
+        if state is None:
+            pos_q = offset + positions
+        else:
+            offset = torch.as_tensor(offset, device=x.device).reshape(-1)
+            pos_q = offset[:, None] + positions
         q, k = apply_interleaved_rope(q, k, pos_q, self.max_period)
         if state is None:
             pos_k = pos_q
@@ -116,8 +122,10 @@ class MimiAttention(nn.Module):
         else:
             pos_k = self.write_ring(k, v, offset, state)
             k, v = state.keys, state.values
-            delta = pos_q.view(-1, 1) - pos_k.view(1, -1)
-            mask = (pos_k.view(1, -1) >= 0) & (delta >= 0) & (delta < self.context)
+            delta = pos_q[:, :, None] - pos_k[:, None, :]
+            mask = ((pos_k[:, None, :] >= 0) & (delta >= 0) & (delta < self.context))[
+                :, None
+            ]
         out = functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.out_proj(rearrange(out, "b h t d -> b t (h d)"))
 
@@ -125,7 +133,7 @@ class MimiAttention(nn.Module):
         self,
         k: torch.Tensor,
         v: torch.Tensor,
-        offset: int | torch.Tensor,
+        offset: torch.Tensor,
         state: AttentionState,
     ) -> torch.Tensor:
         """Store this step in the ring and label every slot as the reference does.
@@ -135,10 +143,15 @@ class MimiAttention(nn.Module):
         non-streaming mask in forward applies the same rule without the ring.
         """
         capacity = self.context
-        slots = torch.arange(k.shape[2], device=k.device) + offset
-        state.keys.index_copy_(2, slots % capacity, k)
-        state.values.index_copy_(2, slots % capacity, v)
-        end_offset = offset + k.shape[2]
+        slots = torch.arange(k.shape[2], device=k.device) + offset[:, None]
+        if k.shape[0] == 1:
+            state.keys.index_copy_(2, slots[0] % capacity, k)
+            state.values.index_copy_(2, slots[0] % capacity, v)
+        else:
+            ring_indices = (slots % capacity)[:, None, :, None].expand_as(k)
+            state.keys.scatter_(2, ring_indices, k)
+            state.values.scatter_(2, ring_indices, v)
+        end_offset = offset[:, None] + k.shape[2]
 
         indexes = torch.arange(capacity, device=k.device)
         delta = indexes - end_offset % capacity
@@ -195,7 +208,7 @@ class MimiTransformerLayer(nn.Module):
 
 @dataclass
 class TransformerState:
-    """Steps taken so far, as a 0-dim tensor a device graph reads, and each ring."""
+    """Per-stream positions and attention rings at fixed addresses."""
 
     offset: torch.Tensor
     layers: list[AttentionState]
@@ -225,7 +238,7 @@ class MimiTransformer(StreamingModule):
     def init_state(self, batch_size: int) -> TransformerState:
         device = self.layers[0].self_attn.in_proj_weight.device
         return TransformerState(
-            offset=torch.zeros((), dtype=torch.long, device=device),
+            offset=torch.zeros(batch_size, dtype=torch.long, device=device),
             layers=[layer.self_attn.init_state(batch_size) for layer in self.layers],
         )
 
