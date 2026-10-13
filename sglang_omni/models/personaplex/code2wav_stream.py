@@ -100,46 +100,51 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
     @torch.inference_mode()
     def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
         with self.state_lock:
-            chunks = [
-                (request_id, item, self.codes_from_chunk(item))
-                for request_id, item in items
-            ]
-            for _, group in groupby(
-                chunks, key=lambda chunk: (chunk[2].shape[0], chunk[2].device)
-            ):
-                chunks = [chunk for chunk in group if not self.is_aborted(chunk[0])]
-                if not chunks:
-                    continue
-                else:
-                    pass
-                try:
-                    states = [
-                        self.stream_state(request_id) for request_id, _, _ in chunks
+            try:
+                stream_chunks = [
+                    (request_id, item, self.codes_from_chunk(item))
+                    for request_id, item in items
+                ]
+                for _, chunk_group in groupby(
+                    stream_chunks,
+                    key=lambda chunk: (chunk[2].shape[0], chunk[2].device),
+                ):
+                    ready_chunks = [
+                        chunk for chunk in chunk_group if not self.is_aborted(chunk[0])
                     ]
-                    codes = torch.stack([codes.T for _, _, codes in chunks]).to(
+                    if not ready_chunks:
+                        continue
+                    else:
+                        pass
+                    stream_states = [
+                        self.stream_state(request_id)
+                        for request_id, _, _ in ready_chunks
+                    ]
+                    codes = torch.stack([codes.T for _, _, codes in ready_chunks]).to(
                         device=self.decode_slots.codec.device
                     )
                     waveforms = (
                         self.decode_slots.decode_batch(
-                            codes, [state.decode_slot for state in states]
+                            codes, [state.decode_slot for state in stream_states]
                         )
                         .float()
                         .cpu()
                     )
-                except Exception as exc:
-                    for request_id, _, _ in chunks:
+                    for (request_id, item, _), state, waveform in zip(
+                        ready_chunks, stream_states, waveforms[:, 0], strict=True
+                    ):
+                        message = self.waveform_message(
+                            request_id, state, item, waveform
+                        )
                         if not self.is_aborted(request_id):
-                            self.emit_error(request_id, exc)
-                            self.abort(request_id)
+                            self.outbox.put(message)
                         else:
                             pass
-                    continue
-                for (request_id, item, _), state, waveform in zip(
-                    chunks, states, waveforms[:, 0], strict=True
-                ):
-                    message = self.waveform_message(request_id, state, item, waveform)
+            except Exception as exc:
+                for request_id, _ in items:
                     if not self.is_aborted(request_id):
-                        self.outbox.put(message)
+                        self.emit_error(request_id, exc)
+                        self.abort(request_id)
                     else:
                         pass
 

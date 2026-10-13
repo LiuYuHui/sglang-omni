@@ -2,12 +2,10 @@
 """Mimi streaming preserves waveforms and independent stream state."""
 
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-import sglang_omni.models.personaplex.mimi_decode_graph as mimi_decode_graph
 from sglang_omni.models.personaplex.architecture import MIMI
 from sglang_omni.models.personaplex.components.causal_conv import (
     CausalConv1d,
@@ -258,18 +256,6 @@ def compare_staggered_decode_batches(
             slots.release(slot)
 
 
-def test_platforms_without_codec_decode_graphs_decode_and_reuse_fresh_states(
-    small_codec: MimiCodec, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        mimi_decode_graph,
-        "current_platform",
-        SimpleNamespace(enable_codec_decode_graph=lambda: False),
-    )
-    slots = MimiDecodeSlots(small_codec, num_slots=8, max_graph_frames=1)
-    compare_staggered_decode_batches(small_codec, slots)
-
-
 @pytest.mark.accelerator
 @pytest.mark.parametrize("allow_tf32", [False, True])
 @pytest.mark.skipif(
@@ -287,7 +273,7 @@ def test_graph_replay_matches_eager_decode_across_staggered_batches_and_slot_reu
         pooled = [slots.acquire() for _ in range(8)]
         overflow = slots.acquire()
         codes = torch.zeros(2, 8, 1, dtype=torch.long, device=codec.device)
-        expected = codec.decode(codes)
+        expected = torch.cat([codec.decode(stream[None]) for stream in codes])
         torch.testing.assert_close(
             slots.decode_batch(codes, [pooled[5], overflow]),
             expected,

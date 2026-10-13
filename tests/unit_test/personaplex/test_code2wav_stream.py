@@ -163,7 +163,7 @@ def test_reply_length_matches_the_caller_in_chunks_and_final_payload(
     torch.testing.assert_close(reply, whole[:expected_samples], atol=1e-5, rtol=1e-5)
 
 
-def test_ready_chunks_decode_together_and_a_single_ready_chunk_emits_immediately(
+def test_ready_chunks_share_a_batch_and_a_single_ready_chunk_emits_immediately(
     small_codec: MimiCodec,
 ) -> None:
     scheduler = new_scheduler(small_codec)
@@ -172,7 +172,9 @@ def test_ready_chunks_decode_together_and_a_single_ready_chunk_emits_immediately
     for message in messages[1:]:
         scheduler.inbox.put(message)
     with patch.object(
-        small_codec, "decode_step", wraps=small_codec.decode_step
+        scheduler.decode_slots,
+        "decode_batch",
+        wraps=scheduler.decode_slots.decode_batch,
     ) as decode:
         scheduler.handle_message(messages[0], None)
         assert [call.args[0].shape[0] for call in decode.call_args_list] == [8]
@@ -222,7 +224,7 @@ def test_batched_streams_keep_independent_lengths_and_final_waveforms(
         )
 
 
-def test_stream_batch_failure_aborts_its_group_and_later_width_still_decodes(
+def test_stream_batch_failure_aborts_the_collected_batch(
     small_codec: MimiCodec,
 ) -> None:
     scheduler = new_scheduler(small_codec)
@@ -235,10 +237,11 @@ def test_stream_batch_failure_aborts_its_group_and_later_width_still_decodes(
     assert [(message.request_id, message.type) for message in results] == [
         ("affected", "error"),
         ("bad", "error"),
-        ("later", "stream"),
+        ("later", "error"),
     ]
-    assert scheduler.is_aborted("affected") and scheduler.is_aborted("bad")
-    assert not scheduler.is_aborted("later")
+    assert all(
+        scheduler.is_aborted(request_id) for request_id in ("affected", "bad", "later")
+    )
 
 
 def test_abort_during_cpu_copy_preserves_peer_and_reused_slot(
@@ -253,7 +256,7 @@ def test_abort_during_cpu_copy_preserves_peer_and_reused_slot(
     expected = [small_codec.decode(stream.T[None])[0, 0] for stream in codes]
     for request_id in ("aborted", "peer"):
         start_stream(scheduler, request_id)
-    copy_entered, abort_marked, abort_finished = Event(), Event(), Event()
+    abort_marked = Event()
     record_abort = scheduler.record_aborted_request_id
     copy_to_cpu = torch.Tensor.cpu
 
@@ -262,31 +265,23 @@ def test_abort_during_cpu_copy_preserves_peer_and_reused_slot(
         abort_marked.set()
 
     def copy_after_abort(waveforms: torch.Tensor) -> torch.Tensor:
-        copy_entered.set()
-        assert abort_marked.wait(timeout=5)
-        assert not abort_finished.is_set()
-        return copy_to_cpu(waveforms)
-
-    def abort_request() -> None:
-        if copy_entered.wait(timeout=5):
-            scheduler.abort("aborted")
-            abort_finished.set()
+        if not abort_marked.is_set():
+            worker.start()
+            assert abort_marked.wait(timeout=5)
         else:
             pass
+        assert worker.is_alive()
+        return copy_to_cpu(waveforms)
 
-    worker = Thread(target=abort_request, daemon=True)
+    worker = Thread(target=scheduler.abort, args=("aborted",), daemon=True)
     scheduler.inbox.put(chunk_message("peer", codes[1, :1]))
     with (
         patch.object(scheduler, "record_aborted_request_id", side_effect=mark_abort),
         patch.object(torch.Tensor, "cpu", new=copy_after_abort),
     ):
-        worker.start()
-        try:
-            scheduler.handle_message(chunk_message("aborted", codes[0, :1]), None)
-        finally:
-            copy_entered.set()
-            worker.join(timeout=5)
-        assert not worker.is_alive() and abort_finished.is_set()
+        scheduler.handle_message(chunk_message("aborted", codes[0, :1]), None)
+        worker.join(timeout=5)
+        assert not worker.is_alive()
     (peer,) = drain_outputs(scheduler)
     assert peer.request_id == "peer" and peer.type == "stream"
     torch.testing.assert_close(

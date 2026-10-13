@@ -95,39 +95,32 @@ class MimiDecodeSlots:
                                 codec.decode_step(input_codes, self.decode_states[0])
                             else:
                                 self.decode_selected(input_codes, slot_indices)
-                    if batch_size == 1:
-                        for slot_index, decode_state in enumerate(self.decode_states):
-                            with graph_backend.capture(
-                                pool=graph_pool,
-                                stream=capture_stream,
-                                thread_local_errors=True,
-                            ) as graph:
-                                output_waveform = codec.decode_step(
-                                    input_codes, decode_state
-                                )
-                            self.slot_graphs[(slot_index, chunk_frames)] = (
-                                CapturedDecode(
-                                    graph=graph,
-                                    input_codes=input_codes,
-                                    output_waveform=output_waveform,
-                                    slot_indices=slot_indices,
-                                )
-                            )
-                    else:
+                    for slot_index in range(num_slots if batch_size == 1 else 1):
                         with graph_backend.capture(
                             pool=graph_pool,
                             stream=capture_stream,
                             thread_local_errors=True,
                         ) as graph:
-                            output_waveform = self.decode_selected(
-                                input_codes, slot_indices
-                            )
-                        self.graphs[(batch_size, chunk_frames)] = CapturedDecode(
+                            if batch_size == 1:
+                                output_waveform = codec.decode_step(
+                                    input_codes, self.decode_states[slot_index]
+                                )
+                            else:
+                                output_waveform = self.decode_selected(
+                                    input_codes, slot_indices
+                                )
+                        captured_decode = CapturedDecode(
                             graph=graph,
                             input_codes=input_codes,
                             output_waveform=output_waveform,
                             slot_indices=slot_indices,
                         )
+                        if batch_size == 1:
+                            self.slot_graphs[(slot_index, chunk_frames)] = (
+                                captured_decode
+                            )
+                        else:
+                            self.graphs[(batch_size, chunk_frames)] = captured_decode
             device_module.current_stream(device).wait_stream(capture_stream)
             self.state_pool.reset()
             device_module.synchronize(device)
@@ -190,7 +183,7 @@ class MimiDecodeSlots:
     def decode_batch(
         self, codes_BKF: torch.Tensor, slots: list[DecodeSlot]
     ) -> torch.Tensor:
-        """Decode distinct streams together, with storage valid until the next decode."""
+        """Decode ready streams, with storage valid until the next decode."""
         batch_size = len(slots)
         if batch_size == 1:
             return self.decode_step(codes_BKF, slots[0])
@@ -209,20 +202,12 @@ class MimiDecodeSlots:
                 captured_decode.graph.replay()
                 return captured_decode.output_waveform
         else:
-            decode_state = self.codec.init_decode_state(batch_size=batch_size)
-            stream_tensors = [slot.decode_state.tensors() for slot in slots]
-            batch_tensors = decode_state.tensors()
-            for batch_tensor, stream_rows in zip(
-                batch_tensors, zip(*stream_tensors, strict=True), strict=True
-            ):
-                batch_tensor.copy_(torch.cat(stream_rows, dim=0))
-            waveform = self.codec.decode_step(codes_BKF, decode_state)
-            for row_index, stream_state in enumerate(stream_tensors):
-                for stream_tensor, batch_tensor in zip(
-                    stream_state, batch_tensors, strict=True
-                ):
-                    stream_tensor.copy_(batch_tensor[row_index : row_index + 1])
-            return waveform
+            return torch.cat(
+                [
+                    self.codec.decode_step(codes[None], slot.decode_state)
+                    for codes, slot in zip(codes_BKF, slots, strict=True)
+                ]
+            )
 
 
 __all__ = ["DecodeSlot", "MimiDecodeSlots"]
