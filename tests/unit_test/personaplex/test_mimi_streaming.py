@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal
 
 import pytest
@@ -101,7 +102,6 @@ def test_a_reset_decode_state_decodes_like_a_fresh_one(random_codec):
 
 
 @pytest.mark.parametrize("mode", ["encode", "decode", "both"])
-@pytest.mark.parametrize("chunk_frames", [1, 4])
 @pytest.mark.parametrize(
     "device", ["cpu", pytest.param("cuda", marks=pytest.mark.accelerator)]
 )
@@ -109,7 +109,6 @@ def test_selectively_loaded_codec_matches_full_codec(
     random_codec: MimiCodec,
     mimi_checkpoint: Path,
     mode: Literal["encode", "decode", "both"],
-    chunk_frames: int,
     device: str,
 ) -> None:
     if device == "cuda" and not torch.cuda.is_available():
@@ -117,10 +116,7 @@ def test_selectively_loaded_codec_matches_full_codec(
     else:
         pass
     reference_codec = random_codec.to(device=device)
-    if mode == "both":
-        codec = load_mimi_codec(mimi_checkpoint, device=device)
-    else:
-        codec = load_mimi_codec(mimi_checkpoint, device=device, mode=mode)
+    codec = load_mimi_codec(mimi_checkpoint, device=device, mode=mode)
     assert codec.device == reference_codec.device
     assert not codec.training
     assert all(parameter.dtype == torch.float32 for parameter in codec.parameters())
@@ -138,20 +134,13 @@ def test_selectively_loaded_codec_matches_full_codec(
         torch.testing.assert_close(codec.encode(waveform), codes, atol=0, rtol=0)
         encode_state = codec.init_encode_state(batch_size=1)
         reference_encode_state = reference_codec.init_encode_state(batch_size=1)
-        encoded_chunks = [
-            codec.encode_step(waveform_chunk, encode_state)
-            for waveform_chunk in waveform.split(codec.samples_per_frame, dim=-1)
-        ]
-        reference_encoded_chunks = [
-            reference_codec.encode_step(waveform_chunk, reference_encode_state)
-            for waveform_chunk in waveform.split(codec.samples_per_frame, dim=-1)
-        ]
-        torch.testing.assert_close(
-            torch.cat(encoded_chunks, dim=-1),
-            torch.cat(reference_encoded_chunks, dim=-1),
-            atol=0,
-            rtol=0,
-        )
+        for waveform_chunk in waveform.split(codec.samples_per_frame, dim=-1):
+            torch.testing.assert_close(
+                codec.encode_step(waveform_chunk, encode_state),
+                reference_codec.encode_step(waveform_chunk, reference_encode_state),
+                atol=0,
+                rtol=0,
+            )
     else:
         pass
     if mode != "encode":
@@ -159,26 +148,20 @@ def test_selectively_loaded_codec_matches_full_codec(
         torch.testing.assert_close(
             codec.decode(codes), expected_waveform, atol=0, rtol=0
         )
-        decode_state = codec.init_decode_state(
-            batch_size=1, max_chunk_frames=chunk_frames
-        )
-        reference_decode_state = reference_codec.init_decode_state(
-            batch_size=1, max_chunk_frames=chunk_frames
-        )
-        decoded_chunks = [
-            codec.decode_step(code_chunk, decode_state)
-            for code_chunk in codes.split(chunk_frames, dim=-1)
-        ]
-        reference_decoded_chunks = [
-            reference_codec.decode_step(code_chunk, reference_decode_state)
-            for code_chunk in codes.split(chunk_frames, dim=-1)
-        ]
-        torch.testing.assert_close(
-            torch.cat(decoded_chunks, dim=-1),
-            torch.cat(reference_decoded_chunks, dim=-1),
-            atol=0,
-            rtol=0,
-        )
+        for chunk_frames in (1, 4):
+            decode_state = codec.init_decode_state(
+                batch_size=1, max_chunk_frames=chunk_frames
+            )
+            reference_decode_state = reference_codec.init_decode_state(
+                batch_size=1, max_chunk_frames=chunk_frames
+            )
+            for code_chunk in codes.split(chunk_frames, dim=-1):
+                torch.testing.assert_close(
+                    codec.decode_step(code_chunk, decode_state),
+                    reference_codec.decode_step(code_chunk, reference_decode_state),
+                    atol=0,
+                    rtol=0,
+                )
     else:
         pass
 
@@ -200,10 +183,11 @@ def test_selective_loading_requires_quantizer_weights(
 ) -> None:
     checkpoint_weights = load_file(str(mimi_checkpoint))
     checkpoint_weights.pop(missing_weight)
-    incomplete_checkpoint = tmp_path / "incomplete.safetensors"
-    save_file(checkpoint_weights, str(incomplete_checkpoint))
-    with pytest.raises(RuntimeError, match="Missing key"):
-        load_mimi_codec(incomplete_checkpoint, device="cpu", mode=mode)
+    with TemporaryDirectory(dir=tmp_path) as checkpoint_directory:
+        incomplete_checkpoint = Path(checkpoint_directory) / "incomplete.safetensors"
+        save_file(checkpoint_weights, str(incomplete_checkpoint))
+        with pytest.raises(RuntimeError, match="Missing key"):
+            load_mimi_codec(incomplete_checkpoint, device="cpu", mode=mode)
 
 
 @pytest.mark.parametrize("mode", ["encode", "decode"])
@@ -214,10 +198,11 @@ def test_selective_loading_rejects_unexpected_active_weights(
 ) -> None:
     checkpoint_weights = load_file(str(mimi_checkpoint))
     checkpoint_weights[f"{mode}r.unexpected.weight"] = torch.zeros(1)
-    invalid_checkpoint = tmp_path / "invalid.safetensors"
-    save_file(checkpoint_weights, str(invalid_checkpoint))
-    with pytest.raises(RuntimeError, match="Unexpected key"):
-        load_mimi_codec(invalid_checkpoint, device="cpu", mode=mode)
+    with TemporaryDirectory(dir=tmp_path) as checkpoint_directory:
+        invalid_checkpoint = Path(checkpoint_directory) / "invalid.safetensors"
+        save_file(checkpoint_weights, str(invalid_checkpoint))
+        with pytest.raises(RuntimeError, match="Unexpected key"):
+            load_mimi_codec(invalid_checkpoint, device="cpu", mode=mode)
 
 
 def test_checkpoint_names_map_onto_the_module_tree():

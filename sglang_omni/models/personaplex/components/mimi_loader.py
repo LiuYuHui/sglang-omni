@@ -80,14 +80,14 @@ def load_mimi_codec(
     else:
         excluded_prefixes = ()
     codec_weights: dict[str, torch.Tensor] = {}
-    with safe_open(str(weights_path), framework="pt", device=str(device)) as checkpoint:
+    with safe_open(str(weights_path), framework="pt") as checkpoint:
         for checkpoint_name in checkpoint.keys():
             renamed = rename_mimi_key(checkpoint_name)
             if renamed is None or renamed.startswith(excluded_prefixes):
                 pass
             else:
                 codec_weights[renamed] = checkpoint.get_tensor(checkpoint_name).to(
-                    dtype=torch.float32
+                    device=device, dtype=torch.float32, copy=True
                 )
     codec.load_state_dict(codec_weights, strict=True, assign=True)
     return codec.eval()
