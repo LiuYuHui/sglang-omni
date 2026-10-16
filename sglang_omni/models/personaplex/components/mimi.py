@@ -262,7 +262,6 @@ class ResidualVectorQuantizer(nn.Module):
         self.vq = ResidualVQ(spec.codebook_dim, spec.codebook_size, num_codebooks)
 
     def encode(self, x_BCT: torch.Tensor) -> torch.Tensor:
-        assert self.input_proj is not None
         residual = rearrange(self.input_proj(x_BCT), "b d t -> b t d")
         codes = []
         for layer in self.vq.layers:
@@ -274,7 +273,6 @@ class ResidualVectorQuantizer(nn.Module):
         return torch.stack(codes, dim=1)
 
     def decode(self, codes_BKT: torch.Tensor) -> torch.Tensor:
-        assert self.output_proj is not None
         quantized = None
         for k, layer in enumerate(self.vq.layers[: codes_BKT.shape[1]]):
             level = rearrange(layer.codebook.decode(codes_BKT[:, k]), "b t d -> b d t")
@@ -437,9 +435,6 @@ class MimiCodec(nn.Module):
     @torch.inference_mode()
     def encode(self, wav_B1T: torch.Tensor) -> torch.Tensor:
         """[B, 1, T] with T a multiple of 1920 → codes [B, 8, F]."""
-        assert self.encoder is not None
-        assert self.encoder_transformer is not None
-        assert self.downsample is not None
         latent = self.encoder(wav_B1T)
         latent = self.encoder_transformer(latent)
         return self.quantizer.encode(self.downsample(latent))
@@ -447,16 +442,10 @@ class MimiCodec(nn.Module):
     @torch.inference_mode()
     def decode(self, codes_BKF: torch.Tensor) -> torch.Tensor:
         """Codes [B, 8, F] → waveform [B, 1, F * 1920]."""
-        assert self.upsample is not None
-        assert self.decoder_transformer is not None
-        assert self.decoder is not None
         latent = self.upsample(self.quantizer.decode(codes_BKF))
         return self.decoder(self.decoder_transformer(latent))
 
     def init_encode_state(self, batch_size: int) -> MimiEncodeState:
-        assert self.encoder is not None
-        assert self.encoder_transformer is not None
-        assert self.downsample is not None
         return MimiEncodeState(
             encoder=self.encoder.init_state(batch_size),
             transformer=self.encoder_transformer.init_state(
@@ -469,9 +458,6 @@ class MimiCodec(nn.Module):
     def encode_step(
         self, wav_B1T: torch.Tensor, state: MimiEncodeState
     ) -> torch.Tensor:
-        assert self.encoder is not None
-        assert self.encoder_transformer is not None
-        assert self.downsample is not None
         latent = self.encoder.step(wav_B1T, state.encoder)
         latent = self.encoder_transformer.step(latent, state.transformer)
         latent = self.downsample.step(latent, state.downsample)
@@ -486,9 +472,6 @@ class MimiCodec(nn.Module):
     def init_decode_state(
         self, batch_size: int, *, max_chunk_frames: int
     ) -> MimiDecodeState:
-        assert self.upsample is not None
-        assert self.decoder_transformer is not None
-        assert self.decoder is not None
         return MimiDecodeState(
             upsample=self.upsample.init_state(batch_size),
             transformer=self.decoder_transformer.init_state(
@@ -501,9 +484,6 @@ class MimiCodec(nn.Module):
     def decode_step(
         self, codes_BKF: torch.Tensor, state: MimiDecodeState
     ) -> torch.Tensor:
-        assert self.upsample is not None
-        assert self.decoder_transformer is not None
-        assert self.decoder is not None
         latent = self.upsample.step(self.quantizer.decode(codes_BKF), state.upsample)
         latent = self.decoder_transformer.step(latent, state.transformer)
         return self.decoder.step(latent, state.decoder)
