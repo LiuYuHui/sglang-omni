@@ -16,7 +16,6 @@ GATE_BLOCK_ELEMENTS = 256
 GATE_BLOCK_COUNT = (
     DEPFORMER.ffn_hidden + GATE_BLOCK_ELEMENTS - 1
 ) // GATE_BLOCK_ELEMENTS
-# note (Codex): Triton specializes tensor pointers on 16-byte alignment.
 POINTER_ALIGNMENT_BYTES = 16
 SUPPORTED_DTYPES: frozenset[torch.dtype] = frozenset(
     (torch.float32, torch.bfloat16, torch.float16)
@@ -41,7 +40,6 @@ def rms_norm_f32_kernel(
     row_index = tl.program_id(0)
     lane_indices = tl.arange(0, norm_threads)
     lane_sums = tl.full((norm_threads,), 0, tl.float32)
-    # note (Codex): Matching eager's FP32 accumulation order preserves BF16 rounding.
     for vector_index in tl.static_range(vector_elements):
         vector_sums = tl.full((norm_threads,), 0, tl.float32)
         for chunk_index in tl.static_range(
@@ -98,7 +96,6 @@ def silu_gate_kernel(
         other=0,
     ).to(tl.float32)
     activated_gate = libdevice.div_rn(gate, libdevice.add_rn(1.0, libdevice.exp(-gate)))
-    # note (Codex): Eager SiLU rounds before the separate multiplication kernel.
     rounded_gate = activated_gate.to(gate_up.dtype.element_ty).to(tl.float32)
     activated_values = libdevice.mul_rn(rounded_gate, up)
     tl.store(
@@ -119,7 +116,6 @@ def fused_rms_norm_f32(
     assert alpha.shape == (DEPFORMER.dim,) and alpha.is_contiguous()
     assert alpha.device == hidden_states.device and alpha.dtype in SUPPORTED_DTYPES
     normalized_states = torch.empty_like(hidden_states)
-    # note (Codex): PyTorch reduces each row with fewer lanes as the batch grows.
     norm_threads = max(
         WARP_THREADS, NORM_THREADS >> max(0, hidden_states.shape[0].bit_length() - 2)
     )
