@@ -20,16 +20,13 @@ from sglang_omni.models.personaplex.architecture import (
     TEXT_CARD,
     DepformerSpec,
 )
+from sglang_omni.models.personaplex.components.depformer_kernels import (
+    SUPPORTED_DTYPES,
+    fused_rms_norm_f32,
+    fused_silu_gate,
+)
 from sglang_omni.models.personaplex.sampling import AudioTokenSampler
-
-if torch.version.cuda is not None:
-    from sglang_omni.models.personaplex.components.depformer_kernels import (
-        SUPPORTED_DTYPES,
-        fused_rms_norm_f32,
-        fused_silu_gate,
-    )
-else:
-    pass
+from sglang_omni.platforms import current_platform
 
 
 def rms_norm_f32(x: torch.Tensor, alpha: torch.Tensor, eps: float) -> torch.Tensor:
@@ -50,6 +47,11 @@ class DepformerLayer(nn.Module):
     def __init__(self, spec: DepformerSpec) -> None:
         super().__init__()
         self.spec = spec
+        self.can_fuse_pointwise: bool = (
+            current_platform.is_cuda()
+            and spec.dim == DEPFORMER.dim
+            and spec.ffn_hidden == DEPFORMER.ffn_hidden
+        )
         dim, steps, ffn = spec.dim, spec.steps, spec.ffn_hidden
         self.in_proj_weight = nn.Parameter(torch.empty(steps, 3 * dim, dim))
         self.out_proj_weight = nn.Parameter(torch.empty(steps, dim, dim))
@@ -64,19 +66,7 @@ class DepformerLayer(nn.Module):
         """One step; cache_2BHSD holds this frame's keys and values, slot per step."""
         spec = self.spec
         can_fuse_pointwise = (
-            x_BD.is_cuda
-            and torch.version.cuda is not None
-            and not torch.is_grad_enabled()
-            and x_BD.dtype in SUPPORTED_DTYPES
-            and x_BD.ndim == 2
-            and x_BD.shape[0] > 0
-            and x_BD.shape[1] == DEPFORMER.dim
-            and spec.ffn_hidden == DEPFORMER.ffn_hidden
-            and x_BD.is_contiguous()
-            and self.norm1_alpha.is_contiguous()
-            and self.norm2_alpha.is_contiguous()
-            and self.norm1_alpha.dtype in SUPPORTED_DTYPES
-            and self.norm2_alpha.dtype in SUPPORTED_DTYPES
+            self.can_fuse_pointwise and x_BD.is_cuda and x_BD.dtype in SUPPORTED_DTYPES
         )
         normalize_hidden_states = (
             fused_rms_norm_f32 if can_fuse_pointwise else rms_norm_f32
@@ -143,16 +133,13 @@ class Depformer(nn.Module):
         hidden_states_dtype = self.depformer_in_weight.dtype
         if (
             self.depformer_in_weight.is_cuda
-            and torch.version.cuda is not None
             and hidden_states_dtype in SUPPORTED_DTYPES
-            and self.spec.dim == DEPFORMER.dim
-            and self.spec.ffn_hidden == DEPFORMER.ffn_hidden
+            and any(layer.can_fuse_pointwise for layer in self.layers)
         ):
             normalization_weights = {
                 alpha.dtype: alpha
                 for layer in self.layers
                 for alpha in (layer.norm1_alpha, layer.norm2_alpha)
-                if alpha.dtype in SUPPORTED_DTYPES and alpha.is_contiguous()
             }
             for alpha in normalization_weights.values():
                 for batch_size in (1, 4, 8, 16):
