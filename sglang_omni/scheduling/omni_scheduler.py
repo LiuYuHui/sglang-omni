@@ -52,6 +52,7 @@ from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -1933,7 +1934,17 @@ class OmniScheduler(Generic[RequestDataT]):
             0 if self.draft_worker is None else get_alloc_reserve_per_decode()
         )
         required_tokens = input_len + max_new_tokens + speculative_reserve_tokens
-        kv_capacity = int(self.max_req_len)
+        if (
+            req.session is not None
+            and req.session.streaming
+            and isinstance(
+                self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
+            )
+        ):
+            # note (Codex): The session bridge budgets live KV; evicted positions still count toward the absolute position capacity.
+            kv_capacity = self.model_config.context_len - 1
+        else:
+            kv_capacity = int(self.max_req_len)
         if required_tokens <= kv_capacity:
             return None
         elif required_tokens - speculative_reserve_tokens <= kv_capacity:

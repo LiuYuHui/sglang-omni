@@ -159,7 +159,11 @@ python -m sglang_omni.cli serve \
 | `--mimi_encode.factory.max_concurrency` | 1 | Conversations whose audio Mimi encodes at the same time |
 | `--preprocessing.factory.voice_prompt_cache_bytes` | 512 MiB | Memory for the voice prompts loaded so far |
 
-Every 80 ms of input has to pass Mimi encode, the LM and Mimi decode within 80 ms, or the conversation falls behind; concurrent conversations share that budget, and the LM decodes synchronously. The first conversation after the server starts waits several seconds while the LM runs its first steps. A conversation holds at most the LM context, 8192 positions or about 10.8 minutes (`--lm.engine.context_length` changes it); the unit that would pass it ends the session with `context_exhausted`.
+Every 80 ms of input has to pass Mimi encode, the LM and Mimi decode within 80 ms, or the conversation falls behind; concurrent conversations share that budget, and the LM decodes synchronously. The first conversation after the server starts waits several seconds while the LM runs its first steps.
+
+On a single CUDA GPU with window KV enabled, `page_size=1` and radix caching disabled (the defaults), calls grow their position capacity as needed instead of ending at 8192 positions. `--lm.engine.context_length` sets the initial capacity. Growth preserves absolute rotary positions and retained KV, doubles the position metadata, and rebuilds attention metadata between units. After the first growth the backbone uses eager execution; the Depformer and Mimi decode keep their own CUDA graphs. Growth can delay a unit, so configure a larger initial capacity when a call must avoid that pause.
+
+Window KV holds roughly 3000 positions per running call, but token history, caller/agent history, request-position mappings and rotary caches still grow with call length. Position mappings and rotary caches retain their largest capacity for subsequent calls; closing a call releases its history, KV and request slot. Other configurations retain the configured context limit and end the session with `context_exhausted` when it fills. Offline request limits are unchanged.
 
 The full-duplex server is ready when this returns JSON containing `"native_full_duplex":true`, `"native_unit_ms":80` and the packaged voices under `voices`:
 

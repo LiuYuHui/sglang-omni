@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 from sglang.srt.configs.model_config import get_hybrid_layer_ids, is_hybrid_swa_model
+from sglang.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
 from transformers import PretrainedConfig
 
 from sglang_omni.config.manager import ConfigManager
@@ -254,3 +255,67 @@ def test_depformer_cuda_graph_buckets_accept_dotted_cli(batch_sizes: list[int]) 
         ]
         == batch_sizes
     )
+
+
+@pytest.mark.parametrize(
+    "is_cuda_host,device,tp_size,page_size,disable_radix_cache,window_pool",
+    [
+        (True, "cuda", 1, 1, True, True),
+        (False, "cpu", 1, 1, True, True),
+        (True, "cpu", 1, 1, True, True),
+        (True, "cuda", 2, 1, True, True),
+        (True, "cuda", 1, 64, True, True),
+        (True, "cuda", 1, 1, False, True),
+        (True, "cuda", 1, 1, True, False),
+    ],
+)
+def test_session_growth_requires_supported_window_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    is_cuda_host: bool,
+    device: Literal["cuda", "cpu"],
+    tp_size: int,
+    page_size: int,
+    disable_radix_cache: bool,
+    window_pool: bool,
+) -> None:
+    model_runner = SimpleNamespace(
+        token_to_kv_pool_allocator=(
+            Mock(spec=PureSWATokenToKVPoolAllocator) if window_pool else Mock()
+        )
+    )
+    model_worker = SimpleNamespace(model_runner=model_runner)
+    configuration = SimpleNamespace(
+        device=device,
+        tp_size=tp_size,
+        page_size=page_size,
+        disable_radix_cache=disable_radix_cache,
+    )
+    module = "sglang_omni.models.personaplex.engine_builder"
+    monkeypatch.setattr(PersonaPlexEngineBuilder, "setup_model", Mock())
+    monkeypatch.setattr(f"{module}.resolved_view", Mock(return_value=configuration))
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: is_cuda_host)
+    builder = PersonaPlexSessionEngineBuilder(
+        tokenizer=Mock(),
+        enable_async_decode=False,
+        depformer_cuda_graph_batch_sizes=[],
+        depformer_cuda_graph_sampling=DEFAULT_DEPFORMER_SAMPLING,
+    )
+    builder.setup_model(
+        model_worker=model_worker,
+        checkpoint_dir="checkpoint",
+        device=device,
+        gpu_id=0,
+        server_args=Mock(),
+    )
+    adapter = builder.extra_scheduler_kwargs()["session_adapter"]
+    if (
+        is_cuda_host
+        and device == "cuda"
+        and tp_size == 1
+        and page_size == 1
+        and disable_radix_cache
+        and window_pool
+    ):
+        assert adapter.session_context.model_runner is model_runner
+    else:
+        assert adapter.session_context is None

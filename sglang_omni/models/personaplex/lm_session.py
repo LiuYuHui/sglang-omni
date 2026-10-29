@@ -24,10 +24,14 @@ from sglang_omni.models.personaplex.request_builders import (
     request_sampling,
     timeline_from_state,
 )
+from sglang_omni.models.personaplex.session_context import PersonaPlexSessionContext
 from sglang_omni.models.personaplex.timeline import Timeline, no_codes
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.proto.session import SessionIdentity, TimedChunk
-from sglang_omni.scheduling.sglang_backend.ar_session import ARSessionAdapter
+from sglang_omni.scheduling.sglang_backend.ar_session import (
+    ARSessionAdapter,
+    SessionUnit,
+)
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 
 WORD_BOUNDARY = "▁"
@@ -58,10 +62,12 @@ class PersonaPlexSessionAdapter(ARSessionAdapter):
         vocab_size: int,
         context_length: int,
         tokenizer: SentencePieceProcessor,
+        session_context: PersonaPlexSessionContext | None = None,
     ) -> None:
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.tokenizer = tokenizer
+        self.session_context = session_context
         self.states: dict[SessionIdentity, LMSessionState] = {}
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
@@ -129,7 +135,7 @@ class PersonaPlexSessionAdapter(ARSessionAdapter):
         caller_codes = state.user_codes
         num_forwards = timeline.num_frames + int(caller_codes.shape[0]) + 1
         positions = timeline.num_prompt_positions + num_forwards
-        if positions > self.context_length - 1:
+        if self.session_context is None and positions > self.context_length - 1:
             raise ContextExhaustedError(
                 f"{ContextExhaustedError.CODE}: PersonaPlex session needs {positions} "
                 f"positions but the LM context holds {self.context_length - 1}; "
@@ -162,6 +168,22 @@ class PersonaPlexSessionAdapter(ARSessionAdapter):
         )
         data.talker_model_inputs = history.model_inputs
         return data
+
+    def bind_request(
+        self,
+        session_identity: SessionIdentity,
+        request_data: SGLangARRequestData,
+        unit: SessionUnit,
+    ) -> None:
+        if self.session_context is None:
+            pass
+        else:
+            request = request_data.req
+            required_positions = len(request.origin_input_ids) + int(
+                request.sampling_params.max_new_tokens
+            )
+            # note (Codex): Binding runs after the bridge drains launched work, before scheduler admission can allocate the next position.
+            self.session_context.ensure_capacity(required_positions + 1)
 
     def result(
         self, session_identity: SessionIdentity, request_data: SGLangARRequestData

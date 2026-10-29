@@ -24,12 +24,18 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
     CacheRequestHandle,
     CacheRequestOutcome,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.session.session_controller import Session
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -46,6 +52,11 @@ from sglang_omni.scheduling.message import (
     put_messages,
 )
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler, PendingDecode
+from sglang_omni.scheduling.sglang_backend.ar_session import (
+    ARSessionAdapter,
+    ARSessionBridge,
+    SessionUnit,
+)
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.stage_cache import StageOutputCache
@@ -971,6 +982,7 @@ def enqueue_limit_scheduler(monkeypatch):
 def admission_req(rid: str, token_ids: list[int]) -> SimpleNamespace:
     return SimpleNamespace(
         rid=rid,
+        session=None,
         priority=None,
         weight_version_events=[],
         output_ids=[],
@@ -2168,12 +2180,124 @@ def test_speculative_reserve_rejection_names_the_reserve(monkeypatch) -> None:
         return SimpleNamespace(
             origin_input_ids=[0] * 50,
             sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+            session=None,
         )
 
     assert scheduler.request_kv_capacity_error(request(34)) is None
     message = scheduler.request_kv_capacity_error(request(40))
     assert "16-token speculative decoding reserve" in message
     assert "Lower max_tokens" in message
+
+
+@pytest.mark.parametrize(
+    ("streaming", "window_pool"),
+    [(True, True), (False, True), (None, True), (True, False)],
+)
+def test_request_capacity_uses_grown_positions_only_for_streaming_window_kv(
+    published_config: None, streaming: bool | None, window_pool: bool
+) -> None:
+    """A growing window session was rejected at the scheduler's startup token limit."""
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.draft_worker = None
+    scheduler.max_req_len = 127
+    scheduler.model_config = SimpleNamespace(context_len=256)
+    scheduler.token_to_kv_pool_allocator = Mock(
+        spec=(
+            PureSWATokenToKVPoolAllocator
+            if window_pool
+            else PagedTokenToKVPoolAllocator
+        )
+    )
+    request = Req(
+        rid="grown-session",
+        origin_input_text="",
+        origin_input_ids=array("q", [1] * 128),
+        sampling_params=SamplingParams(max_new_tokens=127),
+        session=(
+            None
+            if streaming is None
+            else Session(capacity_of_str_len=128, streaming=streaming)
+        ),
+    )
+
+    message = scheduler.request_kv_capacity_error(request)
+
+    if streaming and window_pool:
+        assert message is None
+        request.sampling_params.max_new_tokens = 128
+        message = scheduler.request_kv_capacity_error(request)
+        assert "required_tokens=256, kv_capacity=255" in message
+    else:
+        assert "required_tokens=255, kv_capacity=127" in message
+
+
+def test_grown_window_session_still_requires_free_physical_kv(
+    published_config: None,
+) -> None:
+    """Allowing more logical positions must retain incremental physical KV admission."""
+    scheduler = object.__new__(OmniScheduler)
+    scheduler.draft_worker = None
+    scheduler.max_req_len = 127
+    scheduler.model_config = SimpleNamespace(context_len=256)
+    scheduler.req_to_token_pool = ReqToTokenPool(
+        2, 260, "cpu", enable_memory_saver=False
+    )
+    kv_pool = SWAKVPool(
+        size=0,
+        size_swa=4,
+        page_size=1,
+        dtype=torch.float32,
+        head_num=1,
+        head_dim=8,
+        swa_attention_layer_ids=[0],
+        full_attention_layer_ids=[],
+        device="cpu",
+    )
+    allocator = PureSWATokenToKVPoolAllocator(
+        size_swa=4,
+        page_size=1,
+        dtype=torch.float32,
+        device="cpu",
+        kvcache=kv_pool,
+        need_sort=False,
+    )
+    scheduler.token_to_kv_pool_allocator = allocator
+    assert allocator.alloc(2) is not None
+    identity = SessionIdentity("grown-session")
+    request = Req(
+        rid="grown-session-append",
+        origin_input_text="",
+        origin_input_ids=array("q", [1] * 128),
+        sampling_params=SamplingParams(max_new_tokens=2),
+        session=Session(
+            capacity_of_str_len=128, session_id=identity.id, streaming=True
+        ),
+    )
+    scheduler.tree_cache = Mock(spec=BasePrefixCache)
+    scheduler.tree_cache.session_records.return_value = {
+        identity.id: ReqKvInfo(
+            req_pool_idx=1, kv_committed_len=128, kv_allocated_len=128
+        )
+    }
+    scheduler.tree_cache.evictable_size.return_value = 0
+    bridge = ARSessionBridge(scheduler, ARSessionAdapter())
+    bridge.units_by_request_id[request.rid] = SessionUnit(
+        request_id=request.rid,
+        session_identity=identity,
+        stages=("lm",),
+        chunk=TimedChunk("audio", 0, 160, 0, b""),
+        session_request=request,
+    )
+
+    assert scheduler.request_kv_capacity_error(request) is None
+    assert bridge.check_session_capacity(request.rid) is None
+
+    competing_tokens = allocator.alloc(1)
+    assert competing_tokens is not None
+    assert bridge.check_session_capacity(request.rid) == "session KV capacity exhausted"
+
+    allocator.free(competing_tokens)
+    assert bridge.check_session_capacity(request.rid) is None
 
 
 @pytest.mark.parametrize(
@@ -3151,6 +3275,7 @@ def test_omni_scheduler_distinguishes_queue_enter_from_prefill_start(
 
     req = SimpleNamespace(
         rid="req-delayed",
+        session=None,
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
@@ -3214,6 +3339,7 @@ def scheduler_with_build_pool(monkeypatch, builder) -> OmniScheduler:
 def built_request(request_id: str) -> SimpleNamespace:
     req = SimpleNamespace(
         rid=request_id,
+        session=None,
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
@@ -3992,6 +4118,7 @@ def test_omni_scheduler_prepares_custom_request_token_budget() -> None:
     sampling_params = SimpleNamespace(max_new_tokens=10, min_new_tokens=0)
     req = SimpleNamespace(
         rid="req-ok",
+        session=None,
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=sampling_params,
@@ -4035,6 +4162,7 @@ def test_omni_scheduler_clamps_request_to_strict_prefill_budget() -> None:
     )
     req = SimpleNamespace(
         rid="req-near-capacity",
+        session=None,
         origin_input_ids=[1] * 9,
         origin_input_ids_unpadded=[1] * 9,
         sampling_params=sampling_params,
@@ -4096,6 +4224,7 @@ def test_omni_scheduler_rejects_custom_request_over_context() -> None:
 
     req = SimpleNamespace(
         rid="req-long",
+        session=None,
         origin_input_ids=[1, 2, 3, 4, 5],
         origin_input_ids_unpadded=[1, 2, 3, 4, 5],
         sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
@@ -4156,6 +4285,7 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors(monkeypatch) -> N
 
     over_context_req = SimpleNamespace(
         rid="req-long",
+        session=None,
         origin_input_ids=[1, 2, 3, 4, 5],
         origin_input_ids_unpadded=[1, 2, 3, 4, 5],
         sampling_params=SimpleNamespace(max_new_tokens=10, min_new_tokens=0),
@@ -4174,6 +4304,7 @@ def test_omni_scheduler_follower_rejections_do_not_emit_errors(monkeypatch) -> N
 
     over_kv_req = SimpleNamespace(
         rid="req-kv",
+        session=None,
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=SimpleNamespace(max_new_tokens=4, min_new_tokens=0),
@@ -4211,6 +4342,7 @@ def test_omni_scheduler_leaves_request_budget_unchanged_without_opt_in() -> None
     sampling_params = SimpleNamespace(max_new_tokens=3, min_new_tokens=0)
     req = SimpleNamespace(
         rid="req-original",
+        session=None,
         origin_input_ids=[1, 2, 3],
         origin_input_ids_unpadded=[1, 2, 3],
         sampling_params=sampling_params,

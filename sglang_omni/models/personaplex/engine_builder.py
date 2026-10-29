@@ -14,6 +14,7 @@ from typing import Protocol
 import torch
 from sentencepiece import SentencePieceProcessor
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.model_runner.model_worker import ModelWorker
@@ -35,6 +36,7 @@ from sglang_omni.models.personaplex.request_builders import (
     lm_stream_output_builder,
 )
 from sglang_omni.models.personaplex.sampling import AudioSampling
+from sglang_omni.models.personaplex.session_context import PersonaPlexSessionContext
 from sglang_omni.models.personaplex.sglang_model import PersonaPlexForCausalLM
 from sglang_omni.models.weight_loader import resolve_model_path
 from sglang_omni.platforms import current_platform
@@ -229,6 +231,39 @@ class PersonaPlexSessionEngineBuilder(PersonaPlexEngineBuilder):
             context_length=context_length,
         )
         self.tokenizer = tokenizer
+        self.session_context: PersonaPlexSessionContext | None = None
+
+    def setup_model(
+        self,
+        *,
+        model_worker: ModelWorker,
+        checkpoint_dir: str,
+        device: str | torch.device,
+        gpu_id: int,
+        server_args: ServerArgs,
+    ) -> None:
+        super().setup_model(
+            model_worker=model_worker,
+            checkpoint_dir=checkpoint_dir,
+            device=device,
+            gpu_id=gpu_id,
+            server_args=server_args,
+        )
+        model_runner = model_worker.model_runner
+        config = resolved_view(server_args)
+        if (
+            current_platform.is_cuda()
+            and config.device == "cuda"
+            and config.tp_size == 1
+            and config.page_size == 1
+            and config.disable_radix_cache
+            and isinstance(
+                model_runner.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
+            )
+        ):
+            self.session_context = PersonaPlexSessionContext(model_runner)
+        else:
+            pass
 
     def generation_defaults(self, *, dtype: str) -> GenerationDefaults:
         return {
@@ -243,5 +278,6 @@ class PersonaPlexSessionEngineBuilder(PersonaPlexEngineBuilder):
                 vocab_size=TEXT_CARD,
                 context_length=self.context_length,
                 tokenizer=self.tokenizer,
+                session_context=self.session_context,
             )
         }

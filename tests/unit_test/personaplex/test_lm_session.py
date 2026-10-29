@@ -2,6 +2,7 @@
 """A call stepped unit by unit through the LM session adapter is the offline request."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -9,14 +10,17 @@ import torch
 from sglang_omni.admission import ContextExhaustedError
 from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.personaplex.architecture import TEXT_MARKER_IDS
+from sglang_omni.models.personaplex.hf_config import DEFAULT_CONTEXT_LENGTH
 from sglang_omni.models.personaplex.lm_session import PersonaPlexSessionAdapter
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
 from sglang_omni.models.personaplex.request_builders import (
     apply_lm_result,
     build_lm_request,
 )
+from sglang_omni.models.personaplex.session_context import PersonaPlexSessionContext
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.proto.session import SessionIdentity, TimedChunk
+from sglang_omni.scheduling.sglang_backend.ar_session import SessionUnit
 
 from .test_model_runner import FakeModel, make_runner
 
@@ -204,11 +208,58 @@ def test_only_the_first_unit_sends_ids():
     assert later.req.sampling_params.max_new_tokens == 2
 
 
-def test_a_unit_past_the_context_fails_as_context_exhausted():
+def test_a_unit_past_the_context_fails_as_context_exhausted() -> None:
+    """Unsupported runtimes retain a clear error at the configured session limit."""
     with pytest.raises(ContextExhaustedError) as error:
-        CallDriver(open_adapter(context_length=0)).build(caller_codes(1))
+        CallDriver(open_adapter(context_length=DEFAULT_CONTEXT_LENGTH)).build(
+            caller_codes(DEFAULT_CONTEXT_LENGTH)
+        )
     # Note (wilsonzheng0327): Stage IPC carries only the message to the client.
     assert ContextExhaustedError.matches(RuntimeError(str(error.value)))
+
+
+def test_session_growth_uses_native_history_before_admission() -> None:
+    """Long calls grow from their retained native history before scheduler admission."""
+    session_context = Mock(spec=PersonaPlexSessionContext)
+    adapter = PersonaPlexSessionAdapter(
+        vocab_size=32000,
+        context_length=DEFAULT_CONTEXT_LENGTH,
+        tokenizer=PieceTokenizer(),
+        session_context=session_context,
+    )
+    adapter.open(CALL, OmniRequest(inputs=None))
+    request_data = adapter.build(CALL, unit_chunk(0), unit_payload(0, caller_codes(1)))
+    native_history = list(range(DEFAULT_CONTEXT_LENGTH))
+    request_data.req.origin_input_ids = native_history
+    session_unit = SessionUnit(
+        request_id="unit-0", session_identity=CALL, stages=("lm",), chunk=unit_chunk(0)
+    )
+    adapter.bind_request(CALL, request_data, session_unit)
+    session_context.ensure_capacity.assert_called_once_with(
+        len(native_history) + request_data.req.sampling_params.max_new_tokens + 1
+    )
+    assert request_data.req.origin_input_ids is native_history
+
+
+def test_a_failed_session_growth_propagates_before_admission() -> None:
+    """A failed resize cannot let an oversized request reach scheduler allocation."""
+    session_context = Mock(spec=PersonaPlexSessionContext)
+    session_context.ensure_capacity.side_effect = RuntimeError("growth failed")
+    adapter = PersonaPlexSessionAdapter(
+        vocab_size=32000,
+        context_length=DEFAULT_CONTEXT_LENGTH,
+        tokenizer=PieceTokenizer(),
+        session_context=session_context,
+    )
+    adapter.open(CALL, OmniRequest(inputs=None))
+    request_data = adapter.build(
+        CALL, unit_chunk(0), unit_payload(0, caller_codes(DEFAULT_CONTEXT_LENGTH))
+    )
+    session_unit = SessionUnit(
+        request_id="unit-0", session_identity=CALL, stages=("lm",), chunk=unit_chunk(0)
+    )
+    with pytest.raises(RuntimeError, match="growth failed"):
+        adapter.bind_request(CALL, request_data, session_unit)
 
 
 def test_an_empty_end_of_input_is_relayed_without_a_step():

@@ -16,6 +16,7 @@ import torch
 from sglang.srt.managers.io_struct import SessionParams, TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
@@ -803,6 +804,51 @@ def test_ar_bridge_binds_the_native_request_and_hands_an_aborted_unit_to_the_ada
     adapter.on_abort.assert_called_once_with(identity, unit)
     assert order == ["model", "native"]
     assert bridge.sessions[identity.id].unit is None
+
+
+def test_pending_long_session_appends_reserve_only_new_kv() -> None:
+    """Two queued appends counted one session's retained history as new physical KV."""
+    scheduler = Mock(spec=OmniScheduler)
+    scheduler.req_to_token_pool = SimpleNamespace(free_slots=[3, 4])
+    scheduler.token_to_kv_pool_allocator = Mock()
+    scheduler.tree_cache = Mock()
+    scheduler.tree_cache.evictable_size.return_value = 0
+    records: dict[str, ReqKvInfo] = {}
+    scheduler.tree_cache.session_records.return_value = records
+    bridge = ARSessionBridge(scheduler, ARSessionAdapter())
+    for request_row, session_id in enumerate(("one", "two"), start=1):
+        identity = SessionIdentity(session_id)
+        request = Req(
+            rid=f"{session_id}-append",
+            origin_input_text="",
+            origin_input_ids=array("q", [1] * 20000),
+            sampling_params=SamplingParams(max_new_tokens=1),
+            session=Session(0, session_id, streaming=True),
+        )
+        assert request.kv.kv_allocated_len == 0
+        records[session_id] = ReqKvInfo(
+            req_pool_idx=request_row,
+            kv_allocated_len=20000,
+            kv_committed_len=20000,
+        )
+        records[session_id].set_evicted_seqlen(ComponentType.SWA, 17001)
+        bridge.units_by_request_id[request.rid] = SessionUnit(
+            request_id=request.rid,
+            session_identity=identity,
+            stages=("lm",),
+            chunk=TimedChunk("audio", 0, 80, 0, b""),
+            session_request=request,
+        )
+
+    scheduler.token_to_kv_pool_allocator.available_size.return_value = 2
+    assert bridge.check_session_capacity("one-append") is None
+    assert bridge.check_session_capacity("two-append") is None
+
+    scheduler.token_to_kv_pool_allocator.available_size.return_value = 1
+    for request_id in bridge.units_by_request_id:
+        assert (
+            bridge.check_session_capacity(request_id) == "session KV capacity exhausted"
+        )
 
 
 NATIVE_SESSION_ID = "native"
